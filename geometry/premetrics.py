@@ -58,40 +58,40 @@ class SpectralLaplacianPremetric(BasePremetric):
         self.tau = tau
         self.ambient_weight = ambient_weight
 
-        # Subsample landmarks from data
-        idx = torch.randperm(data.shape[0])[: min(num_landmarks, data.shape[0])]
-        landmarks = data[idx].clone().detach()
-        self.register_buffer("landmarks", landmarks)
+        with torch.no_grad():
+            # Subsample landmarks from data
+            idx = torch.randperm(data.shape[0])[: min(num_landmarks, data.shape[0])]
+            landmarks = data[idx].clone().detach()
 
-        # Build symmetric normalized Graph Laplacian L_sym = I - D^{-1/2} K D^{-1/2}
-        dist_sq = torch.cdist(landmarks, landmarks) ** 2
-        K_mat = torch.exp(-dist_sq / (2.0 * sigma ** 2))
-        deg = K_mat.sum(dim=-1) + 1e-8
-        deg_inv_sqrt = torch.pow(deg, -0.5)
-        S = deg_inv_sqrt.unsqueeze(1) * K_mat * deg_inv_sqrt.unsqueeze(0)
+            # Build symmetric normalized Graph Laplacian L_sym = I - D^{-1/2} K D^{-1/2}
+            dist_sq = torch.cdist(landmarks, landmarks) ** 2
+            K_mat = torch.exp(-dist_sq / (2.0 * sigma ** 2))
+            deg = K_mat.sum(dim=-1) + 1e-8
+            deg_inv_sqrt = torch.pow(deg, -0.5)
+            S = deg_inv_sqrt.unsqueeze(1) * K_mat * deg_inv_sqrt.unsqueeze(0)
 
-        # Eigendecomposition of S (largest eigenvalues of S correspond to smallest of L_sym)
-        evals_S, evecs_S = torch.linalg.eigh(S)
-        # Sort descending in S -> ascending in Laplacian eigenvalue lambda_i = (1 - mu_i) / sigma^2
-        evals_S = torch.flip(evals_S, dims=[0])
-        evecs_S = torch.flip(evecs_S, dims=[1])
+            # Eigendecomposition of S
+            evals_S, evecs_S = torch.linalg.eigh(S)
+            evals_S = torch.flip(evals_S, dims=[0])
+            evecs_S = torch.flip(evecs_S, dims=[1])
 
-        # Skip trivial constant eigenvector i=0
-        k_use = min(num_eigen, landmarks.shape[0] - 1)
-        mu_i = torch.clamp(evals_S[1 : k_use + 1], min=1e-4, max=0.9999)
-        lambda_i = (1.0 - mu_i) / (sigma ** 2)
-        u_i = evecs_S[:, 1 : k_use + 1]  # [M, K]
+            # Skip trivial constant eigenvector i=0
+            k_use = min(num_eigen, landmarks.shape[0] - 1)
+            mu_i = torch.clamp(evals_S[1 : k_use + 1], min=1e-4, max=0.9999)
+            lambda_i = (1.0 - mu_i) / (sigma ** 2)
+            u_i = evecs_S[:, 1 : k_use + 1]  # [M, K]
 
-        if mode == "diffusion":
-            w_i = torch.exp(-2.0 * tau * lambda_i)
-        else:  # biharmonic
-            w_i = 1.0 / (lambda_i ** 2 + 1e-4)
-            w_i = w_i / w_i.max()
+            if mode == "diffusion":
+                w_i = torch.exp(-2.0 * tau * lambda_i)
+            else:  # biharmonic
+                w_i = 1.0 / (lambda_i ** 2 + 1e-4)
+                w_i = w_i / w_i.max()
 
-        self.register_buffer("deg_landmarks", deg)
-        self.register_buffer("mu_i", mu_i)
-        self.register_buffer("u_i", u_i)
-        self.register_buffer("w_i", w_i)
+            self.register_buffer("landmarks", landmarks.detach())
+            self.register_buffer("deg_landmarks", deg.detach())
+            self.register_buffer("mu_i", mu_i.detach())
+            self.register_buffer("u_i", u_i.detach())
+            self.register_buffer("w_i", w_i.detach())
 
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         """Differentiable Nyström extension phi(x) for arbitrary x in R^D."""

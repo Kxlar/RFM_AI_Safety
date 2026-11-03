@@ -44,49 +44,66 @@ class RiemannianFlowMatching(nn.Module):
         Computes the RFM conditional vector field from a premetric d(x, x1):
             u_t(x | x1) = - [d(x, x1) / (1 - t)] * grad_g d(x, x1) / ||grad_g d(x, x1)||_g
         """
+        x_clean = x.detach().clone().requires_grad_(True)
+        x1_clean = x1.detach().clone()
+
         with torch.enable_grad():
-            x_in = x.detach().requires_grad_(True)
-            d_val = self.premetric.distance(x_in, x1.detach())  # [B]
-            grad_euc = torch.autograd.grad(d_val.sum(), x_in)[0].detach()  # [B, D]
-            d_val = d_val.detach()  # <--- CRITICAL: detach d_val from the freed x_in graph!
+            d_val = self.premetric.distance(x_clean, x1_clean)  # [B]
+            grad_euc = torch.autograd.grad(
+                outputs=d_val.sum(),
+                inputs=x_clean,
+                create_graph=False,
+                retain_graph=False,
+            )[0]
+
+        # Immediately detach both d_val and grad_euc so zero graph references survive
+        d_val_det = d_val.detach()
+        grad_euc_det = grad_euc.detach()
+        x_det = x.detach()
+        t_det = t.detach()
 
         with torch.no_grad():
             if self.metric is not None:
-                grad_g = self.metric.riemannian_gradient(x.detach(), grad_euc)
+                grad_g = self.metric.riemannian_gradient(x_det, grad_euc_det)
                 norm_g = torch.sqrt(
-                    torch.clamp(self.metric.norm_squared(x.detach(), grad_g), min=1e-8)
+                    torch.clamp(self.metric.norm_squared(x_det, grad_g), min=1e-8)
                 ).unsqueeze(-1)
                 unit_dir = grad_g / norm_g
             else:
-                norm_euc = torch.linalg.norm(grad_euc, dim=-1, keepdim=True) + 1e-8
-                unit_dir = grad_euc / norm_euc
+                norm_euc = torch.linalg.norm(grad_euc_det, dim=-1, keepdim=True) + 1e-8
+                unit_dir = grad_euc_det / norm_euc
 
-            denom = torch.clamp(1.0 - t, min=0.04)
-            ut = -(d_val.unsqueeze(-1) / denom) * unit_dir
+            denom = torch.clamp(1.0 - t_det, min=0.04)
+            ut = -(d_val_det.unsqueeze(-1) / denom) * unit_dir
+
         return ut.detach()
 
     def sample_conditional_path(
         self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x0_d = x0.detach()
+        x1_d = x1.detach()
+        t_d = t.detach()
+
         if self.premetric is None:
-            xt = (1.0 - t) * x0 + t * x1
-            ut = x1 - x0
+            xt = (1.0 - t_d) * x0_d + t_d * x1_d
+            ut = x1_d - x0_d
             return xt.detach(), ut.detach()
 
         if not self.simulate_premetric_ode:
-            xt = (1.0 - t) * x0 + t * x1
-            ut = self._premetric_conditional_velocity(xt, x1, t)
+            xt = (1.0 - t_d) * x0_d + t_d * x1_d
+            ut = self._premetric_conditional_velocity(xt, x1_d, t_d)
             return xt.detach(), ut.detach()
 
-        xt = x0.clone().detach()
-        dt_step = t / self.ode_sim_steps
-        s = torch.zeros_like(t)
+        xt = x0_d.clone()
+        dt_step = t_d / self.ode_sim_steps
+        s = torch.zeros_like(t_d)
         for _ in range(self.ode_sim_steps):
-            u_s = self._premetric_conditional_velocity(xt, x1, s)
+            u_s = self._premetric_conditional_velocity(xt, x1_d, s)
             xt = (xt + dt_step * u_s).detach()
             s = s + dt_step
 
-        ut = self._premetric_conditional_velocity(xt, x1, t)
+        ut = self._premetric_conditional_velocity(xt, x1_d, t_d)
         return xt.detach(), ut.detach()
 
     def fit(
@@ -101,20 +118,28 @@ class RiemannianFlowMatching(nn.Module):
         optimizer = optim.AdamW(self.v_net.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(data), batch_size=batch_size, shuffle=True
+            torch.utils.data.TensorDataset(data.detach()), batch_size=batch_size, shuffle=True
         )
 
         pbar = tqdm(range(epochs), desc="Training RFM")
         for _ in pbar:
             epoch_loss = 0.0
             for (x1,) in loader:
-                x1 = x1.to(device)
+                x1 = x1.to(device).detach()
                 x0 = torch.randn_like(x1)
                 if self.coupler is not None:
-                    x0, x1 = self.coupler.couple(x0, x1)
+                    with torch.no_grad():
+                        x0, x1 = self.coupler.couple(x0, x1)
+                        x0, x1 = x0.detach(), x1.detach()
 
-                t = torch.rand(x1.shape[0], 1, device=device) * 0.96
+                t = (torch.rand(x1.shape[0], 1, device=device) * 0.96).detach()
                 xt, ut = self.sample_conditional_path(x0, x1, t)
+
+                # Strictly verify xt, ut, t have no autograd history before forward pass
+                xt = xt.detach()
+                ut = ut.detach()
+                t = t.detach()
+
                 vt = self.v_net(xt, t)
                 diff = vt - ut
 
