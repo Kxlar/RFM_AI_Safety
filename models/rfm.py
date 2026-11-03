@@ -46,19 +46,24 @@ class RiemannianFlowMatching(nn.Module):
         """
         with torch.enable_grad():
             x_in = x.detach().requires_grad_(True)
-            d_val = self.premetric.distance(x_in, x1)  # [B]
-            grad_euc = torch.autograd.grad(d_val.sum(), x_in)[0]  # [B, D]
+            d_val = self.premetric.distance(x_in, x1.detach())  # [B]
+            grad_euc = torch.autograd.grad(d_val.sum(), x_in)[0].detach()  # [B, D]
+            d_val = d_val.detach()  # <--- CRITICAL: detach d_val from the freed x_in graph!
 
-        if self.metric is not None:
-            grad_g = self.metric.riemannian_gradient(x, grad_euc)
-            norm_g = torch.sqrt(torch.clamp(self.metric.norm_squared(x, grad_g), min=1e-8)).unsqueeze(-1)
-            unit_dir = grad_g / norm_g
-        else:
-            norm_euc = torch.linalg.norm(grad_euc, dim=-1, keepdim=True) + 1e-8
-            unit_dir = grad_euc / norm_euc
+        with torch.no_grad():
+            if self.metric is not None:
+                grad_g = self.metric.riemannian_gradient(x.detach(), grad_euc)
+                norm_g = torch.sqrt(
+                    torch.clamp(self.metric.norm_squared(x.detach(), grad_g), min=1e-8)
+                ).unsqueeze(-1)
+                unit_dir = grad_g / norm_g
+            else:
+                norm_euc = torch.linalg.norm(grad_euc, dim=-1, keepdim=True) + 1e-8
+                unit_dir = grad_euc / norm_euc
 
-        denom = torch.clamp(1.0 - t, min=0.04)
-        return -(d_val.unsqueeze(-1) / denom) * unit_dir
+            denom = torch.clamp(1.0 - t, min=0.04)
+            ut = -(d_val.unsqueeze(-1) / denom) * unit_dir
+        return ut.detach()
 
     def sample_conditional_path(
         self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor
@@ -66,14 +71,14 @@ class RiemannianFlowMatching(nn.Module):
         if self.premetric is None:
             xt = (1.0 - t) * x0 + t * x1
             ut = x1 - x0
-            return xt, ut
+            return xt.detach(), ut.detach()
 
         if not self.simulate_premetric_ode:
             xt = (1.0 - t) * x0 + t * x1
             ut = self._premetric_conditional_velocity(xt, x1, t)
-            return xt, ut
+            return xt.detach(), ut.detach()
 
-        xt = x0.clone()
+        xt = x0.clone().detach()
         dt_step = t / self.ode_sim_steps
         s = torch.zeros_like(t)
         for _ in range(self.ode_sim_steps):
@@ -82,7 +87,7 @@ class RiemannianFlowMatching(nn.Module):
             s = s + dt_step
 
         ut = self._premetric_conditional_velocity(xt, x1, t)
-        return xt, ut
+        return xt.detach(), ut.detach()
 
     def fit(
         self,
@@ -114,7 +119,9 @@ class RiemannianFlowMatching(nn.Module):
                 diff = vt - ut
 
                 if self.metric is not None:
-                    loss = torch.mean(self.metric.norm_squared(xt, diff))
+                    with torch.no_grad():
+                        G = self.metric.metric_tensor(xt).detach()
+                    loss = torch.mean(torch.einsum("bi,bij,bj->b", diff, G, diff))
                 else:
                     loss = torch.mean(diff ** 2)
 

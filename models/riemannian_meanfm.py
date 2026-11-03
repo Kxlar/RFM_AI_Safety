@@ -107,7 +107,8 @@ class RiemannianMeanFlow(nn.Module):
                 diff = u_pred - u_target
 
                 if self.metric is not None:
-                    G = self.metric.metric_tensor(xt)
+                    with torch.no_grad():
+                        G = self.metric.metric_tensor(xt).detach()
                     loss = torch.mean(torch.bmm(diff.unsqueeze(1), torch.bmm(G, diff.unsqueeze(-1))))
                 else:
                     loss = torch.mean(diff ** 2)
