@@ -1,0 +1,267 @@
+# Riemannian Generative Flows & Geometric Obstacle Steering
+
+[![Institution](https://img.shields.io/badge/DTU-Technical%20University%20of%20Denmark-red.svg)](https://www.dtu.dk/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.2+](https://img.shields.io/badge/PyTorch-2.2+-ee4c2c.svg)](https://pytorch.org/)
+
+
+A modular PyTorch research framework for training, steering, and evaluating continuous normalizing flows on learned data manifolds. Developed as part of ongoing research at the **Technical University of Denmark (DTU)**, this repository implements **Riemannian Flow Matching (RFM)**, **Metric Flow Matching (MFM)**, and **Riemannian MeanFlow (RMF)** alongside scalable geometric estimators, including **Conditional Riemannian Metric Matching (*Carré du Champ*)**, **LAND**, and **RBF** metrics, to steer generative trajectories away from designated "forbidden" regions while strictly respecting the underlying data geometry.
+
+---
+
+## 1. Motivation & Core Problem
+
+Standard Euclidean Flow Matching (CFM) and Denoising Diffusion models transport probability mass along straight lines $x_t = (1 - t)x_0 + t x_1$ in ambient space $\mathbb{R}^D$. When the underlying data concentrates near a curved, low-dimensional manifold $\mathcal{M} \subset \mathbb{R}^D$ (the *manifold hypothesis*), straight-line interpolants cut across empty off-manifold space ("chordal shortcuts"). 
+
+Furthermore, when steering a generative model away from **forbidden regions** $\mathcal{F} \subset \mathcal{M}$ (to suppress unsafe, biased, or unwanted samples), two fundamental challenges arise:
+1. **Violation of the Continuity Equation via Post-Hoc Projection:** Naively projecting a pre-trained Euclidean vector field onto the manifold tangent space at inference time ($v_{\text{snapped}}(x) = \Gamma(x) v_{\text{CFM}}(x)$) alters the divergence of the flow without adjusting the probability path, violating mass conservation $\partial_t p_t + \operatorname{div}_g(p_t v_t) = 0$ and causing particles to stall at manifold boundaries.
+2. **Euclidean Bleeding & Saddle-Point Stagnation:** Defining repulsive potentials using ambient Euclidean distance $\Vert{}x - c\Vert{}_2$ bleeds across disconnected manifold branches (e.g., pushing points on one branch because they are Euclidean-close to an obstacle on another). Moreover, subtracting a raw repulsive gradient $-\alpha \nabla E(x)$ directly against an oncoming flow creates perpendicular saddle points where trajectories become permanently trapped.
+
+### How This Framework Solves It
+This repository provides a unified testbed comparing **training-time geometric integration** (baking the manifold metric $G(x)$ and obstacle potential $V_t(x)$ directly into the geodesic interpolants, then dropping the metric at inference time) against **inference-time intrinsic steering** (scaling repulsive barriers strictly by the *geodesic distance* $d_g(x, c)$ and applying $g$-orthogonal gyroscopic/Control Barrier Function modulation to eliminate stagnation points).
+
+---
+
+## 2. Repository Architecture & Design Philosophy
+
+The codebase is built around a **decoupled, plug-and-play design**. Generative flow models, Riemannian metric tensors, graph/neural premetrics, optimal transport couplers, and steering potentials adhere to clean abstract interfaces so any combination can be benchmarked from a single CLI command.
+
+
+riemannian_generative/
+├── geometry/
+│   ├── __init__.py
+│   ├── metrics.py           # BaseRiemannianMetric, RiemMetricCDC, LANDMetric, RBFMetric, ConformalObstacleMetric
+│   └── premetrics.py        # BasePremetric, EuclideanPremetric, DiffusionPremetric, BiharmonicPremetric, MFMGeodesicPremetric
+├── transport/
+│   ├── __init__.py
+│   └── ot_couplings.py      # IndependentCoupler, MinibatchOTCoupler (Exact Hungarian & Sinkhorn over any Premetric)
+├── models/
+│   ├── __init__.py
+│   ├── networks.py          # TimeVelocityMLP, IntervalVelocityMLP, MFMGeodesicInterpolantNet
+│   ├── rfm.py               # Riemannian Flow Matching (Premetric-guided & Metric-weighted RCFM)
+│   ├── mfm.py               # Metric Flow Matching (Kinetic + Potential V_t Lagrangian Action + CFM)
+│   └── riemannian_meanfm.py # Riemannian MeanFlow (JVP identity along curved geodesics for 1-to-K step sampling)
+├── steering/
+│   ├── __init__.py
+│   └── repulsion.py         # CompactForbiddenPotential (Wendland C^2 bump), RiemannianRepulsionStreamer (CBF + Gyro curl)
+├── utils/
+│   ├── __init__.py
+│   └── visualization.py     # 3-panel diagnostics: Tissot metric ellipses, geodesics, streamlines, & ODE trajectories
+└── main_demo.py             # Master CLI runner mixing any Model + Metric + Premetric + OT + Obstacle Mode
+
+
+---
+
+## 3. Mathematical Formulation of Modules
+
+### 3.1 Generative Flow Models (`models/`)
+
+#### 1. Riemannian Flow Matching (`rfm.py`)
+
+Adapts Chen & Lipman (2023) to general manifolds equipped with a metric tensor $G(x)$ and a differentiable premetric $d(x, x_1)$. Rather than computing expensive Boundary Value Problems (BVPs) at every training step, RFM constructs the conditional target vector field via the intrinsic Riemannian gradient of the premetric:
+
+
+$$u_t(x \mid x_1) = -\frac{d(x, x_1)}{1 - t} \frac{\operatorname{grad}_g d(x, x_1)}{\left\|\operatorname{grad}_g d(x, x_1)\right\|_{G(x)}}, \quad \operatorname{grad}_g d(x, x_1) = G(x)^{-1} \nabla_x d(x, x_1)$$
+
+
+The velocity network $v_\theta(x_t, t)$ is trained under the induced Riemannian norm:
+
+
+$$\mathcal{L}_{\text{RCFM}}(\theta) = \mathbb{E}_{t, x_0, x_1} \left[ \left(v_\theta(x_t, t) - u_t(x_t \mid x_1)\right)^\top G(x_t) \left(v_\theta(x_t, t) - u_t(x_t \mid x_1)\right) \right]$$
+
+#### 2. Metric Flow Matching (`mfm.py`)
+
+Implements Kapusniak et al. (2024) with an extended **Lagrangian Action** objective to natively avoid forbidden regions.
+
+* **Stage 1 (Neural Geodesic Interpolant):** A boundary-constrained network $\gamma_\eta(x_0, x_1, t) = (1 - t)x_0 + t x_1 + t(1 - t)\operatorname{MLP}_\eta(x_0, x_1, t)$ is trained to minimize the sum of **Kinetic Energy** under $G(x)$ and the **Forbidden Potential Energy** $V_t(x)$:
+
+$$\mathcal{L}_{\text{Action}}(\eta) = \mathbb{E}_{x_0, x_1, t} \left[ \frac{1}{2} \dot{\gamma}_\eta(t)^\top G(\gamma_\eta(t)) \dot{\gamma}_\eta(t) + V_t(\gamma_\eta(t)) \right]$$
+
+
+
+This forces interpolant paths to stay within high-density data regions (where $G(x)$ is small) while smoothly curving around high-potential forbidden obstacles.
+* **Stage 2 (Amortized Flow Matching - Dropping the Metric at Test Time):** Once $\gamma_\eta$ is frozen, $v_\theta(x_t, t)$ regresses the tangent velocity $\dot{\gamma}_\eta(t)$. At inference time, **the metric tensor $G(x)$ and potential $V_t(x)$ are completely dropped**; integrating $\dot{x}_t = v_\theta(x_t, t)$ automatically traces the learned diffeomorphism around the obstacle.
+
+#### 3. Riemannian MeanFlow (`riemannian_meanfm.py`)
+
+Extends MeanFlow (Geng et al., 2025) to curved MFM geodesics. Instead of modeling only the instantaneous velocity $v(x_t, t)$, it learns the **interval-averaged velocity** $u_\theta(x_t, r, t)$ over $[r, t]$ using forward-mode Jacobian-Vector Products (`torch.func.jvp`) via the MeanFlow identity:
+
+
+$$u_{\text{target}} = \operatorname{stopgrad}\left( v_t - (t - r)\left( \partial_x u_\theta \cdot v_t + \partial_t u_\theta \right) \right)$$
+
+
+where $(x_t, v_t) = (\gamma_\eta(x_0, x_1, t), \dot{\gamma}_\eta(x_0, x_1, t))$. This enables **1-step or few-step generation** ($x_1 = x_0 + u_\theta(x_0, 0, 1)$) along curved manifolds without a 100-step ODE solver.
+
+---
+
+### 3.2 Riemannian Metrics (`geometry/metrics.py`)
+
+Each metric inherits from `BaseRiemannianMetric` and provides both the metric tensor $G(x) \in \mathbb{S}_{++}^D$ and the inverse co-metric $G(x)^{-1}$:
+
+| Metric Class | Mathematical Formulation | Key Properties & Use Case |
+| --- | --- | --- |
+| **`RiemMetricCDC`** *(Carré du Champ)* | Trains $\Gamma_\theta(y, \epsilon) = M_\theta^\top M_\theta + \lambda I$ via the denoising loss:
+
+<br>
+
+<br>$\mathbb{E}_{X, Y \mid X} \left\| \Gamma_\theta(Y, \epsilon) - \frac{1}{2\epsilon}(X - Y)(X - Y)^\top \right\|_F$
+
+ | **$\mathcal{O}(1)$ amortized inference** independent of dataset size $N$. $\Gamma_\theta(x)$ estimates the inverse metric (tangent space projector); $G(x) = (\Gamma_\theta(x) + \lambda I)^{-1}$.
+
+ |
+| **`LANDMetric`** *(Locally Adaptive Normal)* | Diagonal/full local covariance inverse:
+
+<br>
+
+<br>$M_{dd}(x) = \sum_{n=1}^N w_n(x)(x_{nd} - x_d)^2 + \rho, \; G(x) = M(x)^{-1}$ | Non-parametric kernel metric (Arvanitidis et al., 2016). Expands distance in sparse regions and contracts distance along the data support.
+
+ |
+| **`RBFMetric`** *(Radial Basis Network)* | Parametric precision weights $M(x) = W \phi(x) + \rho I$, where $\phi_k(x) = \exp(-\kappa \|x - c_k\|^$ and $ $G(x) = M(x)^{-$. | Fast $K$-center clustering approximation (Arvanitidis et al., 2020) with smooth analytical derivatives.
+
+ |
+| **`ConformalObstacleMetric`** | $\widetilde{G}(x) = \left(1 + \beta V(x)\right) G_{\text{base}}(x)$ | Warps any base metric conformally so the Riemannian volume element inflates inside the forbidden region, naturally bending geodesics around it. |
+
+---
+
+### 3.3 Premetrics & Graph/Neural Distances (`geometry/premetrics.py`)
+
+When closed-form logarithmic maps are unavailable, RFM and Minibatch OT rely on differentiable premetrics $d(x, y)$:
+
+* **`EuclideanPremetric`:** Baseline ambient distance $\|x - y\|_2$.
+* **`DiffusionPremetric`:** Constructs a symmetric Markov transition matrix $P$ over $k$-NN landmarks and measures multi-step random walk connectivity $d_{\text{diff}, t}^2(x, y) = \|p_t(x, \cdot) - p_t(y, \cdot)\|_{L^2(1/\pi)}^2$, smoothly interpolating onto arbitrary query points $x \in \mathbb{R}^D$ via kernel Nyström extension.
+* **`BiharmonicPremetric`:** Uses the squared pseudo-inverse of the normalized graph Laplacian $L^\dagger$ to capture global manifold topology and bottleneck structure: $d_B^2(x, y) = (e_x - e_y)^\top (L^\dagger)^2 (e_x - e_y)$.
+* **`MFMGeodesicPremetric`:** Wraps a trained `MFMGeodesicInterpolantNet` $\gamma_\eta$ to compute the Riemannian arc length $\int_0^1 \sqrt{\dot{\gamma}_\eta(t)^\top G(\gamma_\eta(t)) \dot{\gamma}_\eta(t)} \, dt$ via Gauss-Legendre / trapezoidal quadrature in $\mathcal{O}(1)$ forward passes.
+
+---
+
+### 3.4 Optimal Transport & Geodesic Obstacle Steering (`transport/`, `steering/`)
+
+* **Riemannian Minibatch Optimal Transport (`ot_couplings.py`):** Pairs prior noise $x_0$ and data $x_1$ by solving the discrete Kantorovich problem with cost matrix $C_{ij} = d_{\text{premetric}}(x_0^{(i)}, x_1^{(j)})^2$ using either the exact Hungarian algorithm (`exact`) or entropic Sinkhorn-Knopp (`sinkhorn`). Pairing under geodesic/premetric cost prevents noise points on one side of a forbidden obstacle from being matched with data points on the opposite side.
+* **Compactly Supported Geodesic Barrier (`CompactForbiddenPotential`):** Uses a $C^2$ Wendland polynomial bump function evaluated on the premetric/geodesic distance $u = \operatorname{clamp}\left(\frac{d_g(x, c) - r_{\min}}{r_{\max} - r_{\min}}, 0, 1\right)$:
+
+$$V(x) = s \cdot (1 - u)^4 (4u + 1)$$
+
+
+
+Because $V(x) = 0$ and $\nabla V(x) = 0$ identically for all $d_g(x, c) \ge r_{\max}$, **points outside the geodesic neighborhood of the forbidden zone experience zero perturbation**.
+* **CBF + Gyroscopic Circulation (`RiemannianRepulsionStreamer`):** Eliminates perpendicular saddle points during inference-time steering by combining directional Control Barrier amplification with a $g$-orthogonal circulation operator $J_g$ that smoothly slides trajectories tangential to the obstacle boundary.
+
+---
+
+## 4. Installation & Quick Start
+
+### Dependencies
+
+Using `uv` (recommended) or `pip`:
+
+```bash
+uv pip install torch torchvision numpy scipy scikit-learn matplotlib tqdm
+
+```
+
+### Running Experiments via CLI (`main_demo.py`)
+
+#### 1. Metric Flow Matching (MFM) with CDC Metric & Obstacle Baked into Geodesic Action
+
+Trains the Carré du Champ network $\Gamma_\theta(x)$, learns geodesic interpolants that minimize Kinetic + Forbidden Potential energy $V_t(x)$, pairs minibatches via geodesic Optimal Transport, and drops the metric at inference time:
+
+```bash
+python main_demo.py \
+    --model mfm \
+    --metric cdc \
+    --premetric geodesic \
+    --ot premetric \
+    --obstacle-mode baked \
+    --epochs 800 \
+    --output mfm_cdc_baked.png
+
+```
+
+#### 2. MFM with LAND Metric + Geodesic-Scaled Inference Repulsion
+
+Trains MFM on the clean data manifold using the non-parametric LAND metric, then applies geodesic-scaled repulsion with Control Barrier & Gyroscopic circulation at test time:
+
+```bash
+python main_demo.py \
+    --model mfm \
+    --metric land \
+    --premetric geodesic \
+    --ot premetric \
+    --obstacle-mode inference \
+    --alpha 1.5 \
+    --gyro-curl 0.4 \
+    --output mfm_land_inference.png
+
+```
+
+#### 3. Riemannian Flow Matching (RFM) with Biharmonic Premetric & Conformal Metric
+
+Guides conditional flows using the global Biharmonic distance and a conformally warped CDC metric:
+
+```bash
+python main_demo.py \
+    --model rfm \
+    --metric cdc \
+    --premetric biharmonic \
+    --ot premetric \
+    --obstacle-mode both \
+    --output rfm_biharmonic.png
+
+```
+
+#### 4. Riemannian MeanFlow (5-Step Fast Generation Around Obstacles)
+
+Uses the JVP MeanFlow identity along obstacle-avoiding MFM geodesics to generate samples in just 5 function evaluations:
+
+```bash
+python main_demo.py \
+    --model rmeanfm \
+    --metric cdc \
+    --premetric geodesic \
+    --obstacle-mode baked \
+    --output rmeanfm_5step.png
+
+```
+
+---
+
+## 5. Diagnostic Outputs
+
+Every run of `main_demo.py` produces a 3-panel high-resolution diagnostic figure alongside terminal violation metrics (`Path Violations (< r_min)` and `Endpoint Violations (< r_min)`):
+
+1. **Panel 1 (Geometry, Potential & Geodesics):** Displays the data manifold, the forbidden core radius $r_{\min}$ and geodesic cutoff $r_{\max}$, Tissot indicatrices (eigen-ellipses of $G(x)^{-1}$), and 16 learned geodesic curves $\gamma_\eta(t)$.
+
+
+2. **Panel 2 (Steered Streamlines):** Visualizes the velocity field $v(x, t=0.5)$ across the ambient space, showing how flow lines route around the forbidden barrier.
+3. **Panel 3 (Simulated Trajectories):** Plots integrated particle trajectories from $t=0$ (`x` markers) to $t=1$ (`o` markers).
+
+---
+
+## 6. Roadmap & Ongoing Extensions
+
+* [ ] **Riemannian SDEs & Stochastic Gradient Riemannian Langevin Dynamics (SGRLD):** Exploit the Riemannian Fokker-Planck equivalence $b_t(x) = v_t(x) + \frac{\sigma_t^2}{2} \Gamma(x) \nabla \log p_t(x)$ with Stratonovich-to-Itô geometric drift correction to convert trained ODE RFM/MFM models into stochastic samplers without retraining.
+* [ ] **Latent Space Pullback Integration:** Extend `BaseRiemannianMetric` with an `EnsembleVAEPullbackMetric` ($G(z) = \mathbb{E}[J_f(z)^\top J_f(z)]$) for high-dimensional image and biological datasets.
+
+
+
+---
+
+## 7. References
+
+1. **Riemannian Metric Matching:** Bamberger, J., Gosztolai, A., Vandergheynst, P., Bronstein, M., & Jones, I. (2026). *Riemannian Metric Matching for Scalable Geometric Modeling of Distributions*. ICML 2026.
+
+
+2. **Riemannian Flow Matching:** Chen, R. T. Q., & Lipman, Y. (2023). *Riemannian Flow Matching on General Geometries*. arXiv:2302.03660.
+3. **Metric Flow Matching:** Kapusniak, K., Potaptchik, P., Reu, T., Zhang, L., Tong, A., Bronstein, M., Bose, J., & Di Giovanni, F. (2024). *Metric Flow Matching for Smooth Interpolations on the Data Manifold*. NeurIPS 2024.
+
+
+4. **Locally Adaptive Normal Distribution (LAND):** Arvanitidis, G., Hansen, L. K., & Hauberg, S. (2016). *A Locally Adaptive Normal Distribution*. NeurIPS 2016.
+
+
+5. **Latent Space Oddity & Pullback Geometry:** Arvanitidis, G., Hansen, L. K., & Hauberg, S. (2018). *Latent Space Oddity: on the Curvature of Deep Generative Models*. ICLR 2018.
+
+
+6. **MeanFlow:** Geng, Z., Deng, M., Bai, X., Kolter, J. Z., & He, K. (2025). *Mean Flows for One-step Generative Modeling*. arXiv:2505.13447.
+
+
+
