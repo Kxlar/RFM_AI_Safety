@@ -4,7 +4,7 @@ import time
 import copy
 import argparse
 import traceback
-from typing import Dict, Any, List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from sklearn.datasets import make_moons
@@ -50,45 +50,58 @@ def compute_mmd_rbf(x: torch.Tensor, y: torch.Tensor, sigmas=(0.1, 0.25, 0.5, 1.
         return max(mmd.item(), 0.0)
 
 
-def build_experiment_grid(fast_sweep: bool = False) -> List[Dict[str, str]]:
+def build_experiment_grid(include_sinkhorn: bool = False) -> List[Dict[str, str]]:
     """
-    Generates all mathematically applicable combinations of:
-      (model, metric, premetric, ot_mode, ot_method, obstacle_mode)
-    Filters out redundant or non-applicable pairings:
-      - 'geodesic' premetric requires MFM/RMeanFM + a valid Riemannian metric ('cdc', 'land', 'rbf')
-      - When ot_mode == 'none', ot_method is fixed to 'none' (avoids duplicate runs)
-      - When ot_mode == 'euclidean', premetric is only varied for RFM or inference steering
+    Builds a focused, scientifically meaningful benchmark grid:
+      1. Euclidean Control Baseline (1 per model x obstacle_mode):
+         metric='none', premetric='euclidean', ot='euclidean' (exact).
+         Demonstrates why Euclidean geometry fails on curved manifolds & obstacles.
+      2. True Riemannian Suite:
+         - Metrics: strictly Riemannian ('cdc', 'land', 'rbf')
+         - Premetrics:
+             * For RFM: 'diffusion', 'biharmonic'
+             * For MFM & RMeanFM: 'geodesic' (amortized MFM arc-length)
+         - OT: 'none' vs 'premetric' (using the true Riemannian distance cost!)
     """
     models = ["rfm", "mfm", "rmeanfm"]
-    metrics = ["cdc", "land", "rbf", "none"]
+    riemannian_metrics = ["cdc", "land", "rbf"]
     obstacle_modes = ["none", "baked", "inference", "both"]
-    ot_configs = (
-        [("none", "none"), ("premetric", "exact")]
-        if fast_sweep
-        else [("none", "none"), ("euclidean", "exact"), ("premetric", "exact"), ("premetric", "sinkhorn")]
-    )
+
+    ot_riemannian_configs = [("none", "none"), ("premetric", "exact")]
+    if include_sinkhorn:
+        ot_riemannian_configs.append(("premetric", "sinkhorn"))
 
     grid = []
+
     for model_name in models:
-        for metric_name in metrics:
-            # Valid premetrics per model
-            if model_name == "rfm":
-                valid_premetrics = ["euclidean", "diffusion", "biharmonic"]
-            else:
-                # For MFM and RMeanFM, geodesic premetric is available whenever a metric exists
-                valid_premetrics = ["geodesic", "diffusion", "biharmonic", "euclidean"] if metric_name != "none" else ["euclidean", "diffusion", "biharmonic"]
-                if fast_sweep and metric_name != "none":
-                    valid_premetrics = ["geodesic", "diffusion"]
+        # --- A. 1x Euclidean Control Baseline per Model ---
+        for obs_mode in obstacle_modes:
+            # Note: RFM with metric='none' has no metric tensor to warp in 'baked' mode,
+            # so for RFM Euclidean baseline we test 'none' (unsteered) and 'inference' (Euclidean repulsion).
+            if model_name == "rfm" and obs_mode in ["baked", "both"]:
+                continue
+            grid.append(
+                {
+                    "group": "euclidean_baseline",
+                    "model": model_name,
+                    "metric": "none",
+                    "premetric": "euclidean",
+                    "ot": "euclidean",
+                    "ot_method": "exact",
+                    "obstacle": obs_mode,
+                }
+            )
+
+        # --- B. True Riemannian Configurations ---
+        for metric_name in riemannian_metrics:
+            valid_premetrics = ["diffusion", "biharmonic"] if model_name == "rfm" else ["geodesic"]
 
             for premetric_name in valid_premetrics:
-                for ot_mode, ot_method in ot_configs:
+                for ot_mode, ot_method in ot_riemannian_configs:
                     for obs_mode in obstacle_modes:
-                        # Skip 'baked' if there is no metric and model is RFM (nothing to warp)
-                        if model_name == "rfm" and metric_name == "none" and obs_mode in ["baked", "both"]:
-                            continue
-
                         grid.append(
                             {
+                                "group": "riemannian",
                                 "model": model_name,
                                 "metric": metric_name,
                                 "premetric": premetric_name,
@@ -97,17 +110,32 @@ def build_experiment_grid(fast_sweep: bool = False) -> List[Dict[str, str]]:
                                 "obstacle": obs_mode,
                             }
                         )
+
     return grid
 
 
 def make_filename(cfg: Dict[str, str]) -> str:
-    """Produces descriptive filename: e.g. mfm_cdc_geodesic_ot_premetric_exact_baked.png"""
+    """Produces clean, descriptive filename."""
     ot_str = "ot_none" if cfg["ot"] == "none" else f"ot_{cfg['ot']}_{cfg['ot_method']}"
-    return f"{cfg['model']}_{cfg['metric']}_{cfg['premetric']}_{ot_str}_{cfg['obstacle']}.png"
+    prefix = "BASELINE_EUC_" if cfg["group"] == "euclidean_baseline" else ""
+    return f"{prefix}{cfg['model']}_{cfg['metric']}_{cfg['premetric']}_{ot_str}_{cfg['obstacle']}.png"
+
+
+def get_top_moon_peak(raw_x: torch.Tensor, raw_y: torch.Tensor, data_std_x: torch.Tensor) -> torch.Tensor:
+    """
+    Finds the exact standardized coordinates of the crest/peak of the upper half-moon (label == 0).
+    In raw make_moons, the top moon peak is at (0.0, 1.0), which maps to approx (-0.575, +1.48)
+    in standardized coordinates.
+    """
+    top_moon = data_std_x[raw_y == 0]
+    # Select points near the horizontal apex of the upper arch and compute their centroid
+    top_apex_mask = top_moon[:, 1] >= torch.quantile(top_moon[:, 1], 0.92)
+    peak_coord = top_moon[top_apex_mask].mean(dim=0)
+    return peak_coord
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Automated Benchmark Sweep for Riemannian Generative Flows")
+    parser = argparse.ArgumentParser(description="Focused Benchmark Sweep: Euclidean Baseline vs. Riemannian Flows")
     parser.add_argument("--results-dir", type=str, default="./results_sweep", help="Directory to save all plots and CSV")
     parser.add_argument("--epochs", type=int, default=600, help="Training epochs for flow models")
     parser.add_argument("--epochs-cdc", type=int, default=800, help="Training epochs for CDC metric (cached once)")
@@ -115,7 +143,7 @@ def main():
     parser.add_argument("--n-samples", type=int, default=600, help="Evaluation samples per run")
     parser.add_argument("--alpha", type=float, default=1.2, help="Inference repulsion strength")
     parser.add_argument("--gyro-curl", type=float, default=0.35, help="Gyroscopic circulation weight")
-    parser.add_argument("--fast-sweep", action="store_true", help="Run core representative subset (~68 configs instead of ~220)")
+    parser.add_argument("--include-sinkhorn", action="store_true", help="Also test Sinkhorn OT in addition to Exact OT")
     parser.add_argument("--overwrite", action="store_true", help="Re-run even if output PNG already exists")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -124,14 +152,17 @@ def main():
     csv_path = os.path.join(args.results_dir, "summary_results.csv")
     dev = torch.device(args.device)
 
-    # 1. Fixed Seed & Dataset Generation
+    # 1. Fixed Seed & Standardized 2-Moons Dataset
     torch.manual_seed(42)
-    raw_x, _ = make_moons(n_samples=4000, noise=0.07, random_state=42)
-    data = torch.tensor(raw_x, dtype=torch.float32, device=dev)
-    data = (data - data.mean(dim=0)) / data.std(dim=0)
+    raw_x, raw_y = make_moons(n_samples=4000, noise=0.07, random_state=42)
+    raw_x_t = torch.tensor(raw_x, dtype=torch.float32, device=dev)
+    raw_y_t = torch.tensor(raw_y, dtype=torch.long, device=dev)
+    data = (raw_x_t - raw_x_t.mean(dim=0)) / raw_x_t.std(dim=0)
 
-    forbid_center = torch.tensor([-0.50, 0.75], device=dev)
-    r_min, r_max = 0.28, 0.65
+    # Place Forbidden Area directly at the peak/apex of the top half-moon!
+    forbid_center = get_top_moon_peak(raw_x_t, raw_y_t, data).to(dev)
+    r_min, r_max = 0.32, 0.70
+    print(f"Forbidden Zone placed at Top Moon Peak: center = ({forbid_center[0]:.3f}, {forbid_center[1]:.3f}), r_min={r_min}, r_max={r_max}")
 
     # Reference safe ground-truth data (points outside r_min) for MMD calculation
     dists_gt = torch.linalg.norm(data - forbid_center.unsqueeze(0), dim=-1)
@@ -174,19 +205,18 @@ def main():
     # Cache for MFM Stage 1 Geodesic Interpolants: key = (metric_name, is_baked)
     interpolant_cache: Dict[Tuple[str, bool], torch.nn.Module] = {}
 
-    # 4. Build Grid & Run Sequential Benchmark
-    grid = build_experiment_grid(fast_sweep=args.fast_sweep)
+    # 4. Build Focused Grid & Run Benchmark
+    grid = build_experiment_grid(include_sinkhorn=args.include_sinkhorn)
     print("\n" + "=" * 75)
-    print(f"[Phase 3/3] Starting Sequential Benchmark Sweep: {len(grid)} Total Configurations")
+    print(f"[Phase 3/3] Starting Focused Benchmark Sweep: {len(grid)} Meaningful Configurations")
     print("=" * 75)
 
-    # Prepare CSV header if new file
     write_header = not os.path.exists(csv_path) or args.overwrite
     csv_file = open(csv_path, mode="w" if write_header else "a", newline="", encoding="utf-8")
     csv_writer = csv.writer(csv_file)
     if write_header:
         csv_writer.writerow([
-            "index", "filename", "model", "metric", "premetric", "ot", "ot_method", "obstacle_mode",
+            "index", "group", "filename", "model", "metric", "premetric", "ot", "ot_method", "obstacle_mode",
             "path_viol_pct", "end_viol_pct", "safe_mmd", "runtime_sec", "status"
         ])
         csv_file.flush()
@@ -199,7 +229,7 @@ def main():
             print(f"[{idx}/{len(grid)}] SKIPPING (exists): {fname}")
             continue
 
-        print(f"\n[{idx}/{len(grid)}] RUNNING: {fname}")
+        print(f"\n[{idx}/{len(grid)}] RUNNING ({cfg['group']}): {fname}")
         t_start = time.perf_counter()
 
         try:
@@ -211,7 +241,7 @@ def main():
             # Select initial premetric
             premetric = static_premetrics.get(cfg["premetric"], static_premetrics["euclidean"])
 
-            # Create Forbidden Potential
+            # Create Forbidden Potential at the Top Moon Peak
             potential = CompactForbiddenPotential(
                 center=forbid_center,
                 r_min=r_min,
@@ -247,7 +277,6 @@ def main():
                 model.fit(data, epochs=args.epochs, device=dev)
 
             elif cfg["model"] in ["mfm", "rmeanfm"]:
-                # Check if Stage 1 Geodesic Interpolant is already cached for (metric, is_baked)
                 cache_key = (cfg["metric"], is_baked)
                 if cache_key in interpolant_cache:
                     print(f"  -> Using cached MFM Stage 1 Geodesic Interpolant for {cache_key}")
@@ -261,7 +290,7 @@ def main():
                     interpolant_net = mfm_init.interpolant_net
                     interpolant_cache[cache_key] = copy.deepcopy(interpolant_net).cpu()
 
-                # Upgrade to MFMGeodesicPremetric if requested
+                # Upgrade to MFMGeodesicPremetric for Riemannian runs
                 if base_metric is not None and cfg["premetric"] == "geodesic":
                     geo_premetric = MFMGeodesicPremetric(
                         mfm_interpolant=interpolant_net, metric=base_metric, num_quad_steps=12
@@ -323,7 +352,7 @@ def main():
             )
 
             csv_writer.writerow([
-                idx, fname, cfg["model"], cfg["metric"], cfg["premetric"],
+                idx, cfg["group"], fname, cfg["model"], cfg["metric"], cfg["premetric"],
                 cfg["ot"], cfg["ot_method"], cfg["obstacle"],
                 f"{path_viol:.2f}", f"{end_viol:.2f}", f"{mmd_val:.5f}", f"{elapsed:.1f}", "SUCCESS"
             ])
@@ -335,7 +364,7 @@ def main():
             print(f"  -> ERROR in {fname}: {e}")
             traceback.print_exc()
             csv_writer.writerow([
-                idx, fname, cfg["model"], cfg["metric"], cfg["premetric"],
+                idx, cfg["group"], fname, cfg["model"], cfg["metric"], cfg["premetric"],
                 cfg["ot"], cfg["ot_method"], cfg["obstacle"],
                 "NaN", "NaN", "NaN", f"{elapsed:.1f}", f"ERROR: {str(e)}"
             ])
@@ -345,7 +374,7 @@ def main():
             torch.cuda.empty_cache()
 
     csv_file.close()
-    print("\nAll sweeps completed! Summary saved to:", csv_path)
+    print("\nFocused sweep completed! Summary saved to:", csv_path)
 
 
 if __name__ == "__main__":

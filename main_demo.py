@@ -69,22 +69,23 @@ def main():
         base_metric = CDCMetric(dim=2, rank=2, hidden_dim=128, lambda_reg=1e-2).to(dev)
         base_metric.fit(data, epochs=args.epochs, batch_size=256, lr=1e-3, device=dev)
     elif args.metric == "land":
-        base_metric = LANDMetric(data=data, max_Reference_points=600, sigma=0.25, lambda_reg=1e-2).to(dev)
+        sub_idx = torch.randperm(data.shape[0], device=dev)[:600]
+        base_metric = LANDMetric(data=data[sub_idx], sigma=0.25, rho=1e-2)
     elif args.metric == "rbf":
-        base_metric = RBFMetric(data=data, num_centers=80, bandwidth=None, lambda_reg=1e-2).to(dev)
+        base_metric = RBFMetric(data=data, n_centers=80, kappa=1.5, rho=1e-2)
 
     # 3. Initialize Premetric d(x, y)
     premetric = None
     if args.premetric == "euclidean":
-        premetric = EuclideanPremetric().to(dev)
-    elif args.premetric in ["diffusion", "biharmonic"]:
-        premetric = SpectralLaplacianPremetric(
-            data=data, mode=args.premetric, num_landmarks=512, num_eigen=32, sigma=0.35
-        ).to(dev)
+        premetric = EuclideanPremetric()
+    elif args.premetric == "diffusion":
+        premetric = SpectralLaplacianPremetric(mode="diffusion", data=data[:1200], k_neighbors=15, t_steps=4)
+    elif args.premetric == "biharmonic":
+        premetric = SpectralLaplacianPremetric(mode="biharmonic", data=data[:1200], k_neighbors=15, t_steps=4)
 
     # 4. Forbidden Region & Compact Potential V_t(x)
-    forbid_center = torch.tensor([-0.50, 0.75], device=dev)
-    r_min, r_max = 0.28, 0.65
+    forbid_center = torch.tensor([-0.575, 1.48], device=dev)
+    r_min, r_max = 0.32, 0.70
     potential = CompactForbiddenPotential(
         center=forbid_center,
         r_min=r_min,
@@ -96,13 +97,13 @@ def main():
     # Conformal metric wrapper for baking obstacle into RFM metric G_tilde(x) = (1 + beta V(x)) G(x)
     active_metric = base_metric
     if args.obstacle_mode in ["baked", "both"] and base_metric is not None and args.model == "rfm":
-        active_metric = ConformalObstacleMetric(base_metric=base_metric, potential_fn=potential, beta=1.0).to(dev)
+        active_metric = ConformalObstacleMetric(base_metric=base_metric, potential_fn=potential, beta=1.0)
 
     # 5. Configure Optimal Transport Coupler
     if args.ot == "none":
         coupler = IndependentCoupler()
     elif args.ot == "euclidean":
-        coupler = MinibatchOTCoupler(premetric=EuclideanPremetric().to(dev), method=args.ot_method)
+        coupler = MinibatchOTCoupler(premetric=EuclideanPremetric(), method=args.ot_method)
     elif args.ot == "premetric":
         coupler = MinibatchOTCoupler(premetric=premetric, method=args.ot_method)
 
@@ -132,14 +133,11 @@ def main():
         interpolant_net = model.interpolant_net
 
         # Wrap the trained MFM Geodesic Interpolant as a fast amortized Geodesic Premetric!
-        if base_metric is not None:
-            geo_premetric = MFMGeodesicPremetric(
-                mfm_interpolant=interpolant_net, metric=base_metric, num_quad_steps=12
-            ).to(dev)
-            if args.premetric == "geodesic":
-                potential.premetric = geo_premetric
-                if args.ot == "premetric":
-                    model.coupler = MinibatchOTCoupler(premetric=geo_premetric, method=args.ot_method)
+        geo_premetric = MFMGeodesicPremetric(interpolant=interpolant_net, metric=base_metric)
+        if args.premetric == "geodesic":
+            potential.premetric = geo_premetric
+            if args.ot == "premetric":
+                model.coupler = MinibatchOTCoupler(premetric=geo_premetric, method=args.ot_method)
 
         # Stage 2: Train Velocity Field v_theta (drops metric at inference time!)
         model.fit_flow(data, epochs=args.epochs, device=dev)
@@ -152,13 +150,9 @@ def main():
         mfm_stage1.fit_interpolant(data, epochs=int(args.epochs * 0.65), device=dev)
         interpolant_net = mfm_stage1.interpolant_net
 
-        if base_metric is not None and args.premetric == "geodesic":
-            geo_premetric = MFMGeodesicPremetric(
-                mfm_interpolant=interpolant_net, metric=base_metric, num_quad_steps=12
-            ).to(dev)
+        geo_premetric = MFMGeodesicPremetric(interpolant=interpolant_net, metric=base_metric)
+        if args.premetric == "geodesic":
             potential.premetric = geo_premetric
-            if args.ot == "premetric":
-                coupler = MinibatchOTCoupler(premetric=geo_premetric, method=args.ot_method)
 
         model = RiemannianMeanFlow(
             dim=2,
@@ -181,6 +175,7 @@ def main():
     )
 
     if args.model == "rmeanfm" and not apply_inf_repulsion:
+        # 5-step MeanFlow sampling
         x1_gen, traj = model.sample(x0_eval, steps=5)
     else:
         x1_gen, traj = integrate_ode(steered_streamer, x0_eval, steps=args.ode_steps, solver="rk4")
@@ -201,7 +196,7 @@ def main():
         steered_field=steered_streamer,
         metric=base_metric,
         interpolant_net=interpolant_net,
-        potential=potential if args.obstacle_mode != "none" else None,
+        potential=potential,
         title=f"{args.model.upper()} ({args.metric.upper()}) | Path Viol: {path_viol:.1f}%, End Viol: {end_viol:.1f}%",
         output_path=args.output,
     )
