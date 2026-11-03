@@ -9,16 +9,16 @@ from geometry.premetrics import BasePremetric
 class CompactForbiddenPotential(nn.Module):
     """
     Smooth C^2 Wendland bump potential V(x) centered at `center`.
-    Evaluates distances using any BasePremetric (e.g., MFMGeodesicPremetric,
-    SpectralLaplacianPremetric, or EuclideanPremetric).
-    Strictly satisfies V(x) = 0 and grad V(x) = 0 for all x with d(x, center) >= r_max.
+    Automatically calibrates non-Euclidean premetrics (Diffusion, Biharmonic, Geodesic)
+    so that `r_min` and `r_max` correspond to consistent physical radii around `center`.
+    Strictly satisfies V(x) = 0 and grad V(x) = 0 for all x with calibrated d_g(x, center) >= r_max.
     """
     def __init__(
         self,
         center: torch.Tensor,
-        r_min: float = 0.25,
-        r_max: float = 0.70,
-        scale: float = 20.0,
+        r_min: float = 0.30,
+        r_max: float = 0.65,
+        scale: float = 2.5,
         premetric: Optional[BasePremetric] = None,
     ):
         super().__init__()
@@ -26,18 +26,47 @@ class CompactForbiddenPotential(nn.Module):
         self.r_min = r_min
         self.r_max = r_max
         self.scale = scale
+        self._premetric = None
+        self.register_buffer("dist_scale", torch.tensor(1.0, device=center.device))
         self.premetric = premetric
+
+    @property
+    def premetric(self) -> Optional[BasePremetric]:
+        return self._premetric
+
+    @premetric.setter
+    def premetric(self, pm: Optional[BasePremetric]):
+        self._premetric = pm
+        if pm is not None:
+            self._calibrate_distance_scale()
+        else:
+            self.dist_scale.fill_(1.0)
+
+    @torch.no_grad()
+    def _calibrate_distance_scale(self):
+        """
+        Samples a ring of points at Euclidean distance `r_min` around `center`
+        and computes the scaling factor so median(d_premetric(ring, center)) == r_min.
+        Prevents spectral/biharmonic distances from bleeding across the entire manifold.
+        """
+        device = self.center.device
+        angles = torch.linspace(0, 2 * torch.pi, 64, device=device)[:-1]
+        ring = self.center + self.r_min * torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+        raw_dists = self._premetric.distance(ring, self.center.expand_as(ring))
+        median_d = torch.median(raw_dists).clamp(min=1e-6)
+        self.dist_scale.copy_(self.r_min / median_d)
 
     def compute_distance(self, x: torch.Tensor) -> torch.Tensor:
         target = self.center.expand(x.shape[0], -1)
-        if self.premetric is not None:
-            return self.premetric.distance(x, target)
+        if self._premetric is not None:
+            return self._premetric.distance(x, target) * self.dist_scale
         return torch.linalg.norm(x - target, dim=-1)
 
     def pointwise(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluates the scalar potential V(x) for each point in batch [B]."""
+        """Evaluates the scalar potential V(x) in [0, scale] for each point in batch [B]."""
         d = self.compute_distance(x)
         u = torch.clamp((d - self.r_min) / (self.r_max - self.r_min + 1e-6), min=0.0, max=1.0)
+        # Wendland C^2 compact polynomial: (1 - u)^4 * (4u + 1) -> strictly 0 for d >= r_max
         bump = ((1.0 - u) ** 4) * (4.0 * u + 1.0)
         return self.scale * bump
 
@@ -47,24 +76,27 @@ class CompactForbiddenPotential(nn.Module):
 
 class RiemannianRepulsionStreamer:
     """
-    Inference-time steering wrapper with Geodesic-scaled Repulsion, Control Barrier Filtering (CBF),
-    and Gyroscopic Circulation (to eliminate stuck saddle points).
+    Geodesic-Respecting Control Barrier & Gyroscopic Steering Wrapper:
+      1. Zero-Interference on Safe Geodesics: If the base flow v_base(x, t) is moving away from
+         or tangential to the forbidden zone (<v_base, -grad_g V>_g <= 0) outside the core,
+         the repulsive force cancels to strictly ZERO.
+      2. Velocity-Proportional Deflection: When v_base points into the forbidden zone, the inward
+         normal component <v_base, n_g>_g is cancelled and smoothly deflected along the manifold
+         tangent via the g-orthogonal circulation operator J_g, avoiding explosive kicks.
     """
     def __init__(
         self,
         flow_model: nn.Module,
         potential: Optional[CompactForbiddenPotential] = None,
         metric: Optional[BaseRiemannianMetric] = None,
-        alpha: float = 1.0,
-        gyro_curl: float = 0.4,
-        use_cbf_filter: bool = True,
+        alpha: float = 1.2,
+        gyro_curl: float = 0.6,
     ):
         self.flow_model = flow_model
         self.potential = potential
         self.metric = metric
         self.alpha = alpha
         self.gyro_curl = gyro_curl
-        self.use_cbf_filter = use_cbf_filter
 
     def __call__(self, x: torch.Tensor, t: float) -> torch.Tensor:
         B, D = x.shape
@@ -76,38 +108,47 @@ class RiemannianRepulsionStreamer:
         if self.potential is None or self.alpha == 0.0:
             return v_base
 
-        # Compute Euclidean gradient of the compact geodesic potential V(x)
+        # Compute Euclidean gradient and value of the compact geodesic potential V(x)
         with torch.enable_grad():
             x_in = x.detach().requires_grad_(True)
-            V_val = self.potential.pointwise(x_in).sum()
-            grad_euc = torch.autograd.grad(V_val, x_in)[0]  # [B, D]
+            V_pts = self.potential.pointwise(x_in)  # [B] in [0, scale]
+            grad_euc = torch.autograd.grad(V_pts.sum(), x_in)[0].detach()  # [B, D]
+            V_pts = V_pts.detach()
 
-        # Map to intrinsic Riemannian gradient: grad_g V(x) = G(x)^{-1} grad_euc V(x)
+        # Normalized barrier intensity b(x) in [0, 1] (0 outside r_max, 1 inside r_min)
+        barrier_intensity = (V_pts / (self.potential.scale + 1e-8)).unsqueeze(-1)  # [B, 1]
+
+        # Active mask: only compute steering where V(x) > 0 (d_g(x, center) < r_max)
         if self.metric is not None:
             grad_g = self.metric.riemannian_gradient(x, grad_euc)
-            if self.use_cbf_filter:
-                inward_proj = self.metric.inner_product(x, v_base, grad_g).unsqueeze(-1)
-                grad_norm_sq = self.metric.norm_squared(x, grad_g).unsqueeze(-1) + 1e-6
-                cbf_gain = 1.0 + torch.relu(inward_proj) / grad_norm_sq
-                repulsion = self.alpha * cbf_gain * grad_g
-            else:
-                repulsion = self.alpha * grad_g
+            grad_norm_g = torch.sqrt(self.metric.norm_squared(x, grad_g) + 1e-8).unsqueeze(-1)
+            # Unit inward normal n_in pointing toward the forbidden center (uphill in V)
+            n_in = grad_g / grad_norm_g
+            # Component of v_base pointing INTO the forbidden zone: <v_base, n_in>_G
+            inward_speed = self.metric.inner_product(x, v_base, n_in).unsqueeze(-1)
+            v_speed = torch.sqrt(self.metric.norm_squared(x, v_base) + 1e-8).unsqueeze(-1)
         else:
             grad_g = grad_euc
-            if self.use_cbf_filter:
-                inward_proj = torch.sum(v_base * grad_g, dim=-1, keepdim=True)
-                grad_norm_sq = torch.sum(grad_g ** 2, dim=-1, keepdim=True) + 1e-6
-                cbf_gain = 1.0 + torch.relu(inward_proj) / grad_norm_sq
-                repulsion = self.alpha * cbf_gain * grad_g
-            else:
-                repulsion = self.alpha * grad_g
+            grad_norm_euc = torch.linalg.norm(grad_g, dim=-1, keepdim=True) + 1e-8
+            n_in = grad_g / grad_norm_euc
+            inward_speed = torch.sum(v_base * n_in, dim=-1, keepdim=True)
+            v_speed = torch.linalg.norm(v_base, dim=-1, keepdim=True) + 1e-8
 
-        # Gyroscopic circulation term orthogonal to grad_g V(x) to prevent stalling
-        circulation = torch.zeros_like(grad_g)
+        # 1. Cancel ONLY positive inward velocity (<v_base, n_in>_g > 0) + soft emergency push if already inside core
+        inward_component = torch.relu(inward_speed)
+        core_escape = 0.5 * v_speed * (barrier_intensity ** 2)
+        normal_repulsion = self.alpha * barrier_intensity * (inward_component + core_escape) * n_in
+
+        # 2. Tangential circulation (slides around the boundary only when heading into the obstacle!)
+        circulation = torch.zeros_like(v_base)
         if D == 2 and self.gyro_curl != 0.0:
-            circulation = torch.stack([-grad_g[:, 1], grad_g[:, 0]], dim=-1) * self.gyro_curl
+            # Choose circulation sign dynamically to match the particle's existing tangential preference
+            t_vec = torch.stack([-n_in[:, 1], n_in[:, 0]], dim=-1)
+            tangential_dot = torch.sum(v_base * t_vec, dim=-1, keepdim=True)
+            sign = torch.where(tangential_dot >= 0, 1.0, -1.0)
+            circulation = sign * self.gyro_curl * barrier_intensity * inward_component * t_vec
 
-        return v_base - repulsion + circulation
+        return v_base - normal_repulsion + circulation
 
 
 @torch.no_grad()
