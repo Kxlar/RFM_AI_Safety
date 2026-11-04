@@ -364,7 +364,7 @@ def plot_3d_manifold_diagnostics(
         )  # [T, B, 2]
         T_g, B_g, _ = geo_paths.shape
         z_geo_flat, _ = compute_manifold_height(
-            geo_paths.view(T_g * B_g, 2), metric=metric, potential=potential, include_obstacle=True
+            geo_paths.reshape(T_g * B_g, 2), metric=metric, potential=potential, include_obstacle=True
         )
         z_geo = z_geo_flat.reshape(T_g, B_g) + 0.06  # Lift slightly above surface for visibility
         geo_np = geo_paths.detach().cpu().numpy()
@@ -376,8 +376,7 @@ def plot_3d_manifold_diagnostics(
             )
 
     # 3B. Plot Steered Flow Trajectories passing near the Forbidden Zone (Lime/Green Solid)
-    # Filter trajectories from `trajectories` that pass within `zoom_pad` of `forbidden_center`
-    traj_dists = torch.linalg.norm(trajectories - forbidden_center.view(1, 1, 2), dim=-1)
+    traj_dists = torch.linalg.norm(trajectories - forbidden_center.reshape(1, 1, 2), dim=-1)
     near_mask = (traj_dists.min(dim=0)[0] < r_max * 1.35)
     near_trajs = trajectories[:, near_mask, :]
     if near_trajs.shape[1] == 0:
@@ -387,7 +386,7 @@ def plot_3d_manifold_diagnostics(
 
     T_tr, B_tr, _ = near_trajs.shape
     z_tr_flat, _ = compute_manifold_height(
-        near_trajs.view(T_tr * B_tr, 2), metric=metric, potential=potential, include_obstacle=True
+        near_trajs.reshape(T_tr * B_tr, 2), metric=metric, potential=potential, include_obstacle=True
     )
     z_tr = z_tr_flat.reshape(T_tr, B_tr) + 0.05
     tr_np = near_trajs.detach().cpu().numpy()
