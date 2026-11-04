@@ -6,3 +6,6 @@
 *.csv
 *.pt
 *.npy
+
+__pycache__/*
+*.sh
