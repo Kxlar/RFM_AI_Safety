@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from matplotlib.lines import Line2D
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from matplotlib import cm
 from matplotlib.colors import LightSource
