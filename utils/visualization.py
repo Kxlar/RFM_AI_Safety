@@ -284,15 +284,15 @@ def plot_3d_manifold_diagnostics(
     # PANEL 2: 3D Manifold + Forbidden Area Potential Spire
     # =========================================================================
     ax1 = fig.add_subplot(1, 3, 2, projection="3d")
-    # Blend base viridis colormap with Crimson Red on the forbidden spire
+    # Blend base viridis colormap with Crimson Red on the forbidden spire & clip strictly to [0, 1]
     base_rgba = cm.viridis(np.clip(Z_clean / 1.15, 0.0, 1.0))
     obs_weight = np.clip(Z_obs / 1.4, 0.0, 1.0)[..., None]
     spire_rgba = np.array([0.90, 0.12, 0.15, 1.0]).reshape(1, 1, 4)
-    blended_rgba = (1.0 - obs_weight) * base_rgba + obs_weight * spire_rgba
+    blended_rgba = np.clip((1.0 - obs_weight) * base_rgba + obs_weight * spire_rgba, 0.0, 1.0)
 
     ax1.plot_surface(
         gx, gy, Z_total, facecolors=blended_rgba, rstride=1, cstride=1,
-        antialiased=True, alpha=0.85, shade=True
+        antialiased=True, alpha=0.85, shade=False
     )
     ax1.scatter(
         data_sub_np[:, 0], data_sub_np[:, 1], z_data_total + 0.03,
@@ -331,8 +331,7 @@ def plot_3d_manifold_diagnostics(
 
     zoom_base_rgba = cm.viridis(np.clip(Z_zoom_clean / 1.15, 0.0, 1.0))
     zoom_obs_w = np.clip(Z_zoom_obs / 1.4, 0.0, 1.0)[..., None]
-    zoom_rgba = (1.0 - zoom_obs_w) * zoom_base_rgba + zoom_obs_w * spire_rgba
-
+    zoom_rgba = np.clip((1.0 - zoom_obs_w) * zoom_base_rgba + zoom_obs_w * spire_rgba, 0.0, 1.0)
     ax2.plot_surface(
         zx, zy, Z_zoom_tot, facecolors=zoom_rgba, rstride=1, cstride=1,
         antialiased=True, alpha=0.58, shade=False

@@ -89,7 +89,6 @@ def parse_args():
         choices=["none", "baked", "inference", "both"],
         help="'baked': bake V_t(x) into MFM geodesic action / Conformal Metric; 'inference': geodesic-scaled repulsion",
     )
-    parser.add_argument("--plot-3d", action="store_true", default=True, help="Also save a 3D manifold & geodesic surface plot")
     parser.add_argument("--epochs", type=int, default=600)
     parser.add_argument("--epochs-cdc", type=int, default=800)
     parser.add_argument("--ode-steps", type=int, default=100)
@@ -97,6 +96,9 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=1.2, help="Inference repulsion strength")
     parser.add_argument("--gyro-curl", type=float, default=0.6, help="Gyroscopic circulation to slide around obstacles")
     parser.add_argument("--baked-scale", type=float, default=45.0, help="Potential V(x) weight during MFM Stage 1 / Conformal baking")
+    parser.add_argument("--load-existing", action="store_true", help="Load existing trained model checkpoint if available")
+    parser.add_argument("--checkpoint-dir", type=str, default="./results_sweep/checkpoints", help="Directory to save/load model checkpoints")
+    parser.add_argument("--plot-3d", action="store_true", default=True, help="Also save a 3D manifold & geodesic surface plot")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=str, default=None, help="Output PNG path (auto-named if omitted)")
     parser.add_argument("--csv-path", type=str, default="./results_sweep/summary_results.csv", help="CSV file to log results")
@@ -107,6 +109,8 @@ def main():
     args = parse_args()
     dev = torch.device(args.device)
     t_start = time.perf_counter()
+
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # Auto-generate descriptive filename if --output is not specified
     ot_str = "ot_none" if args.ot == "none" else f"ot_{args.ot}_{args.ot_method}"
@@ -121,10 +125,27 @@ def main():
     else:
         out_path = args.output if args.output.endswith(".png") else args.output + ".png"
 
+    # Build Checkpoint Keys:
+    # Note that training only depends on whether the obstacle is baked (`baked` vs `unbaked`),
+    # meaning `none` and `inference` share the exact same trained model weights,
+    # and `baked` and `both` share the exact same trained model weights!
+    is_baked = args.obstacle_mode in ["baked", "both"]
+    train_obs_tag = f"baked{int(args.baked_scale)}" if is_baked else "unbaked"
+
+    interp_ckpt_path = os.path.join(
+        args.checkpoint_dir,
+        f"interpolant_{args.metric}_{train_obs_tag}_ep{args.epochs}.pt",
+    )
+    model_ckpt_path = os.path.join(
+        args.checkpoint_dir,
+        f"model_{args.model}_{args.metric}_{args.premetric}_{ot_str}_{train_obs_tag}_ep{args.epochs}.pt",
+    )
+
     print("=" * 75)
     print(f"Model: {args.model.upper()} | Metric: {args.metric.upper()} | Premetric: {args.premetric.upper()}")
     print(f"OT: {args.ot.upper()} ({args.ot_method}) | Obstacle Mode: {args.obstacle_mode.upper()} | Device: {dev}")
-    print(f"Target Output: {out_path}")
+    print(f"Model Checkpoint: {model_ckpt_path} (Load Existing: {args.load_existing})")
+    print(f"Target Output:    {out_path}")
     print("=" * 75)
 
     # 1. Generate Standardized 2-Moons Dataset & Peak Forbidden Zone
@@ -147,7 +168,7 @@ def main():
     base_metric = None
     if args.metric == "cdc":
         base_metric = CDCMetric(dim=2, rank=2, hidden_dim=128, lambda_reg=1e-2).to(dev)
-        cdc_cache = os.path.join(os.path.dirname(args.csv_path) or ".", "cached_cdc_metric.pt")
+        cdc_cache = os.path.join(args.checkpoint_dir, "cached_cdc_metric.pt")
         if os.path.exists(cdc_cache):
             print(f"Loading cached CDC Metric from {cdc_cache}...")
             base_metric.load_state_dict(torch.load(cdc_cache, map_location=dev))
@@ -155,7 +176,6 @@ def main():
         else:
             print("Training CDC Metric Matching Network...")
             base_metric.fit(data, epochs=args.epochs_cdc, batch_size=256, lr=1e-3, device=dev)
-            os.makedirs(os.path.dirname(cdc_cache) or ".", exist_ok=True)
             torch.save(base_metric.state_dict(), cdc_cache)
     elif args.metric == "land":
         base_metric = LANDMetric(data=data, max_Reference_points=600, sigma=0.25, lambda_reg=1e-2).to(dev)
@@ -172,7 +192,6 @@ def main():
         ).to(dev)
 
     # 4. Forbidden Region & Calibrated Potential V_t(x)
-    # Note: CompactForbiddenPotential automatically calibrates `premetric` so r_min/r_max match physical radii!
     potential = CompactForbiddenPotential(
         center=forbid_center,
         r_min=r_min,
@@ -181,7 +200,6 @@ def main():
         premetric=premetric,
     ).to(dev)
 
-    is_baked = args.obstacle_mode in ["baked", "both"]
     active_metric = base_metric
     if is_baked and base_metric is not None and args.model == "rfm":
         active_metric = ConformalObstacleMetric(base_metric=base_metric, potential_fn=potential, beta=1.0).to(dev)
@@ -194,7 +212,7 @@ def main():
     elif args.ot == "premetric":
         coupler = MinibatchOTCoupler(premetric=premetric, method=args.ot_method)
 
-    # 6. Train Selected Generative Flow Model
+    # 6. Train or Load Selected Generative Flow Model
     interpolant_net = None
 
     if args.model == "rfm":
@@ -205,7 +223,15 @@ def main():
             coupler=coupler,
             simulate_premetric_ode=False,
         ).to(dev)
-        model.fit(data, epochs=args.epochs, device=dev)
+
+        if args.load_existing and os.path.exists(model_ckpt_path):
+            print(f"[Checkpoint] Loading trained RFM model from {model_ckpt_path}...")
+            model.v_net.load_state_dict(torch.load(model_ckpt_path, map_location=dev))
+            model.eval()
+        else:
+            model.fit(data, epochs=args.epochs, device=dev)
+            torch.save(model.v_net.state_dict(), model_ckpt_path)
+            print(f"[Checkpoint] Saved RFM model to {model_ckpt_path}")
 
     elif args.model == "mfm":
         baked_pot = potential if is_baked else None
@@ -215,29 +241,55 @@ def main():
             potential=baked_pot,
             coupler=coupler,
         ).to(dev)
-        # Stage 1: Minimize Kinetic Energy + Forbidden Potential V_t(gamma_eta(t))
-        model.fit_interpolant(data, epochs=int(args.epochs * 0.75), device=dev)
+
+        # Stage 1: Load or Train Geodesic Interpolant
+        if args.load_existing and os.path.exists(interp_ckpt_path):
+            print(f"[Checkpoint] Loading MFM Stage 1 Interpolant from {interp_ckpt_path}...")
+            model.interpolant_net.load_state_dict(torch.load(interp_ckpt_path, map_location=dev))
+            model.interpolant_net.eval()
+        else:
+            model.fit_interpolant(data, epochs=int(args.epochs * 0.75), device=dev)
+            torch.save(model.interpolant_net.state_dict(), interp_ckpt_path)
+            print(f"[Checkpoint] Saved MFM Stage 1 Interpolant to {interp_ckpt_path}")
+
         interpolant_net = model.interpolant_net
 
-        # Wrap the trained MFM Geodesic Interpolant as a fast amortized Geodesic Premetric (num_quad_steps=6 for fast OT)
+        # Wrap the trained MFM Geodesic Interpolant as a fast amortized Geodesic Premetric
         if base_metric is not None:
             geo_premetric = MFMGeodesicPremetric(
                 mfm_interpolant=interpolant_net, metric=base_metric, num_quad_steps=6
             ).to(dev)
             if args.premetric == "geodesic":
-                potential.premetric = geo_premetric  # Automatically recalibrates distance scale!
+                potential.premetric = geo_premetric
                 if args.ot == "premetric":
                     model.coupler = MinibatchOTCoupler(premetric=geo_premetric, method=args.ot_method)
 
-        # Stage 2: Train Velocity Field v_theta (drops metric at inference time!)
-        model.fit_flow(data, epochs=args.epochs, device=dev)
+        # Stage 2: Load or Train Velocity Field v_theta
+        if args.load_existing and os.path.exists(model_ckpt_path):
+            print(f"[Checkpoint] Loading MFM Stage 2 Velocity Field from {model_ckpt_path}...")
+            model.v_net.load_state_dict(torch.load(model_ckpt_path, map_location=dev))
+            model.eval()
+        else:
+            model.fit_flow(data, epochs=args.epochs, device=dev)
+            torch.save(model.v_net.state_dict(), model_ckpt_path)
+            print(f"[Checkpoint] Saved MFM Stage 2 Velocity Field to {model_ckpt_path}")
 
     elif args.model == "rmeanfm":
         baked_pot = potential if is_baked else None
         mfm_stage1 = MetricFlowMatching(
             dim=2, metric=active_metric, potential=baked_pot, coupler=coupler
         ).to(dev)
-        mfm_stage1.fit_interpolant(data, epochs=int(args.epochs * 0.65), device=dev)
+
+        # Stage 1: Load or Train Geodesic Interpolant (shared with MFM!)
+        if args.load_existing and os.path.exists(interp_ckpt_path):
+            print(f"[Checkpoint] Loading Stage 1 Interpolant from {interp_ckpt_path}...")
+            mfm_stage1.interpolant_net.load_state_dict(torch.load(interp_ckpt_path, map_location=dev))
+            mfm_stage1.interpolant_net.eval()
+        else:
+            mfm_stage1.fit_interpolant(data, epochs=int(args.epochs * 0.75), device=dev)
+            torch.save(mfm_stage1.interpolant_net.state_dict(), interp_ckpt_path)
+            print(f"[Checkpoint] Saved Stage 1 Interpolant to {interp_ckpt_path}")
+
         interpolant_net = mfm_stage1.interpolant_net
 
         if base_metric is not None and args.premetric == "geodesic":
@@ -254,7 +306,15 @@ def main():
             metric=active_metric,
             coupler=coupler,
         ).to(dev)
-        model.fit(data, epochs=args.epochs, device=dev)
+
+        if args.load_existing and os.path.exists(model_ckpt_path):
+            print(f"[Checkpoint] Loading trained RMeanFM model from {model_ckpt_path}...")
+            model.u_net.load_state_dict(torch.load(model_ckpt_path, map_location=dev))
+            model.eval()
+        else:
+            model.fit(data, epochs=args.epochs, device=dev)
+            torch.save(model.u_net.state_dict(), model_ckpt_path)
+            print(f"[Checkpoint] Saved RMeanFM model to {model_ckpt_path}")
 
     # 7. Inference & Trajectory Evaluation
     x0_eval = torch.randn(args.n_samples, 2, device=dev)
@@ -320,7 +380,7 @@ def main():
         ])
     print(f"Registered run #{next_idx} into {args.csv_path}")
 
-    # 9. Plot 3-Panel Diagnostics
+    # 9. Plot 2D & 3D Diagnostics
     title_str = (
         f"{args.model.upper()} ({args.metric.upper()}, {args.premetric}, {args.obstacle_mode}) | "
         f"Path Viol: {path_viol:.1f}%, End Viol: {end_viol:.1f}%, MMD: {mmd_val:.3f} (Oracle: {oracle_half_mmd:.3f})"
@@ -339,6 +399,7 @@ def main():
         title=title_str,
         output_path=out_path,
     )
+
     if args.plot_3d:
         out_3d_path = out_path.replace(".png", "_3D.png")
         plot_3d_manifold_diagnostics(
