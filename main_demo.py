@@ -21,7 +21,7 @@ from models.rfm import RiemannianFlowMatching
 from models.mfm import MetricFlowMatching
 from models.riemannian_meanfm import RiemannianMeanFlow
 from steering.repulsion import CompactForbiddenPotential, RiemannianRepulsionStreamer, integrate_ode
-from utils.visualization import plot_full_diagnostics
+from utils.visualization import plot_full_diagnostics, plot_3d_manifold_diagnostics
 
 
 def compute_mmd_rbf(x: torch.Tensor, y: torch.Tensor, sigmas=(0.1, 0.25, 0.5, 1.0)) -> float:
@@ -89,6 +89,7 @@ def parse_args():
         choices=["none", "baked", "inference", "both"],
         help="'baked': bake V_t(x) into MFM geodesic action / Conformal Metric; 'inference': geodesic-scaled repulsion",
     )
+    parser.add_argument("--plot-3d", action="store_true", default=True, help="Also save a 3D manifold & geodesic surface plot")
     parser.add_argument("--epochs", type=int, default=600)
     parser.add_argument("--epochs-cdc", type=int, default=800)
     parser.add_argument("--ode-steps", type=int, default=100)
@@ -338,6 +339,21 @@ def main():
         title=title_str,
         output_path=out_path,
     )
+    if args.plot_3d:
+        out_3d_path = out_path.replace(".png", "_3D.png")
+        plot_3d_manifold_diagnostics(
+            data=data,
+            trajectories=traj,
+            forbidden_center=forbid_center,
+            r_min=r_min,
+            r_max=r_max,
+            metric=base_metric,
+            interpolant_net=interpolant_net,
+            potential=potential,
+            steered_field=steered_streamer,
+            title=f"{args.model.upper()} ({args.metric.upper()}, {args.obstacle_mode})",
+            output_path=out_3d_path,
+        )
 
 
 if __name__ == "__main__":
