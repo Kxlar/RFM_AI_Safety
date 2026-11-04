@@ -7,8 +7,8 @@ from typing import Optional
 class BaseRiemannianMetric(ABC, nn.Module):
     """
     Abstract base class for a Riemannian metric G(x) on R^D.
-    Provides both G(x) (covariant metric tensor, large off-manifold)
-    and Gamma(x) = G(x)^{-1} (contravariant co-metric, small off-manifold).
+    Provides both G(x) (covariant metric tensor, small in data valleys and large off-manifold)
+    and Gamma(x) = G(x)^{-1} (contravariant co-metric, large along data tangent and small off-manifold).
     """
     def __init__(self, dim: int):
         super().__init__()
@@ -42,7 +42,7 @@ class BaseRiemannianMetric(ABC, nn.Module):
 class RBFMetric(BaseRiemannianMetric):
     """
     Isotropic/Diagonal RBF Metric (Arvanitidis et al. / Kapusniak et al., 2024).
-    Places Gaussian kernels on data centers; metric is small near data and 1/lambda far away.
+    Places Gaussian kernels on data centers; G(x) is small in data valleys and 1/lambda_reg on the empty plateau.
     """
     def __init__(
         self,
@@ -57,90 +57,120 @@ class RBFMetric(BaseRiemannianMetric):
         self.register_buffer("centers", centers)
 
         if bandwidth is None:
-            # Median heuristic on pairwise distances
             dists = torch.cdist(centers, centers)
-            bandwidth = torch.median(dists[dists > 0]).item() * 0.5
+            bandwidth = torch.median(dists[dists > 0]).item() * 0.35
         self.bandwidth = bandwidth
         self.lambda_reg = lambda_reg
 
+        with torch.no_grad():
+            d2 = torch.cdist(centers, centers) ** 2
+            w_ref = torch.exp(-d2 / (2.0 * self.bandwidth ** 2)).mean(dim=-1)
+            ref_max = torch.quantile(w_ref, 0.90).clamp(min=1e-6)
+        self.register_buffer("ref_max", ref_max)
+
     def _weight_function(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, D], centers: [M, D]
         dist_sq = torch.cdist(x, self.centers) ** 2  # [B, M]
         weights = torch.exp(-dist_sq / (2.0 * self.bandwidth ** 2))
-        # Normalized local density proxy in (0, 1]
-        h_x = weights.mean(dim=-1) / (weights.mean(dim=-1).max().detach() + 1e-8)
+        h_x = torch.clamp(weights.mean(dim=-1) / self.ref_max, min=0.0, max=1.0)
         return h_x
 
     def metric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         B, D = x.shape
-        h_x = self._weight_function(x)  # [B]
-        scale = 1.0 / (h_x + self.lambda_reg)  # Large when h_x -> 0
-        eye = torch.eye(D, device=x.device).unsqueeze(0).expand(B, D, D)
+        h_x = self._weight_function(x)  # [B] in [0, 1]
+        scale = 1.0 / (0.15 * (h_x ** 2) + self.lambda_reg)
+        eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
         return scale.view(B, 1, 1) * eye
 
     def cometric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         B, D = x.shape
         h_x = self._weight_function(x)
-        scale = h_x + self.lambda_reg
-        eye = torch.eye(D, device=x.device).unsqueeze(0).expand(B, D, D)
+        scale = 0.15 * (h_x ** 2) + self.lambda_reg
+        eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
         return scale.view(B, 1, 1) * eye
 
 
 class LANDMetric(BaseRiemannianMetric):
     """
     Locally Adaptive Normal Distribution (LAND) Metric (Arvanitidis et al., 2016).
-    G(x) = (Sigma(x) + lambda I)^{-1}, where Sigma(x) is the locally weighted covariance matrix:
-    Sigma_ij(x) = sum_n w_n(x) (x_n - x)_i (x_n - x)_j, w_n(x) = exp(-||x - x_n||^2 / 2*sigma^2).
+    Centers the local tangent covariance around the conditional manifold expectation
+    mu(x) = sum_n w_n(x) x_n to prevent off-manifold distance-squared inflation d_perp^2,
+    and gates with the smooth kernel density envelope h(x)^2 so G(x) forms a deep valley
+    on the data manifold and rises smoothly to (1/lambda_reg)*I in empty space.
     """
     def __init__(
         self,
         data: torch.Tensor,
         max_Reference_points: int = 1024,
-        sigma: float = 0.35,
+        sigma: float = 0.22,
         lambda_reg: float = 1e-2,
+        c_iso: float = 0.04,
     ):
         super().__init__(dim=data.shape[-1])
         idx = torch.randperm(data.shape[0])[: min(max_Reference_points, data.shape[0])]
-        self.register_buffer("data", data[idx].clone().detach())
+        ref_pts = data[idx].clone().detach()
+        self.register_buffer("data", ref_pts)
         self.sigma = sigma
         self.lambda_reg = lambda_reg
+        self.c_iso = c_iso
+
+        with torch.no_grad():
+            d2 = torch.cdist(ref_pts, ref_pts) ** 2
+            w_ref = torch.exp(-d2 / (2.0 * (self.sigma * 0.85) ** 2)).mean(dim=-1)
+            ref_density = torch.quantile(w_ref, 0.85).clamp(min=1e-6)
+        self.register_buffer("ref_density", ref_density)
 
     def cometric_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        # Sigma(x) + lambda I acts directly as the contravariant co-metric!
         B, D = x.shape
-        diff = self.data.unsqueeze(0) - x.unsqueeze(1)  # [B, N, D]
-        dist_sq = torch.sum(diff ** 2, dim=-1)          # [B, N]
+        diff_to_x = self.data.unsqueeze(0) - x.unsqueeze(1)  # [B, N, D]
+        dist_sq = torch.sum(diff_to_x ** 2, dim=-1)          # [B, N]
         weights = torch.exp(-dist_sq / (2.0 * self.sigma ** 2))  # [B, N]
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-5)
+        w_norm = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Local covariance: [B, D, D]
-        Sigma = torch.einsum("bn,bni,bnj->bij", weights, diff, diff)
-        eye = torch.eye(D, device=x.device).unsqueeze(0).expand(B, D, D)
-        return Sigma + self.lambda_reg * eye
+        # 1. Conditional manifold mean mu(x) = E[x_data | x] eliminates off-manifold bias!
+        mu_x = w_norm @ self.data  # [B, D]
+        diff_centered = self.data.unsqueeze(0) - mu_x.unsqueeze(1)  # [B, N, D]
+
+        # 2. Local tangent covariance around mu(x), scaled to dimensionless units
+        Sigma_tan = torch.einsum("bn,bni,bnj->bij", w_norm, diff_centered, diff_centered)
+        Sigma_tan = Sigma_tan / (self.sigma ** 2) * 0.20
+
+        # 3. Smooth data-support density envelope h(x) in [0, 1]
+        w_supp = torch.exp(-dist_sq / (2.0 * (self.sigma * 0.85) ** 2))
+        h_x = torch.clamp(w_supp.mean(dim=-1) / self.ref_density, min=0.0, max=1.0).view(B, 1, 1)
+
+        eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
+        return (h_x ** 2) * (Sigma_tan + self.c_iso * eye) + self.lambda_reg * eye
 
     def metric_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        Sigma_reg = self.cometric_tensor(x)
-        return torch.linalg.inv(Sigma_reg)
+        Gamma = self.cometric_tensor(x)
+        return torch.linalg.inv(Gamma)
 
 
 class CDCMetric(BaseRiemannianMetric):
     """
     Learned Carré du Champ (CDC) Riemannian Metric (Bamberger et al., 2026).
-    Trains a neural network to regress the conditional CDC co-metric Gamma_eps(x),
-    and provides G(x) = (Gamma_eps(x) + lambda I)^{-1} for MFM/RFM.
+    Trains a neural network to regress the centered conditional tangent covariance
+    Cov(X | Y=y) / (2*eps) on the manifold, and modulates the learned co-metric with
+    a smooth support envelope h(x)^2 so that:
+      - On the data manifold: Gamma(x) is large and aligned with the manifold tangent (G(x) is small -> valley).
+      - Off the manifold: Gamma(x) decays smoothly to lambda_reg * I (G(x) is large -> high walls).
     """
     def __init__(
         self,
         dim: int = 2,
         rank: int = 2,
         hidden_dim: int = 128,
-        eval_eps: float = 0.05,
+        eval_eps: float = 0.03,
         lambda_reg: float = 1e-2,
+        c_iso: float = 0.04,
+        support_sigma: float = 0.20,
     ):
         super().__init__(dim=dim)
         self.rank = rank
         self.eval_eps = eval_eps
         self.lambda_reg = lambda_reg
+        self.c_iso = c_iso
+        self.support_sigma = support_sigma
 
         self.net = nn.Sequential(
             nn.Linear(dim + 1, hidden_dim),
@@ -151,42 +181,81 @@ class CDCMetric(BaseRiemannianMetric):
             nn.SiLU(),
             nn.Linear(hidden_dim, rank * dim),
         )
+        self.register_buffer("landmarks", torch.zeros(256, dim))
+        self.register_buffer("ref_density", torch.tensor(0.1))
+        self.register_buffer("has_landmarks", torch.tensor(False))
+
+    def _support_envelope(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns smooth density envelope h(x) in [0, 1] (1 on data manifold, 0 in empty space)."""
+        if not self.has_landmarks.item():
+            return torch.ones(x.shape[0], 1, 1, device=x.device, dtype=x.dtype)
+        dist_sq = torch.cdist(x, self.landmarks) ** 2
+        w = torch.exp(-dist_sq / (2.0 * self.support_sigma ** 2)).mean(dim=-1)
+        h_x = torch.clamp(w / self.ref_density, min=0.0, max=1.0)
+        return h_x.view(-1, 1, 1)
 
     def predict_cdc(self, y: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
         if eps.ndim == 1:
             eps = eps.unsqueeze(-1)
         inp = torch.cat([y, torch.log(eps + 1e-8)], dim=-1)
         m = self.net(inp).view(-1, self.rank, self.dim)
+        # Bound raw network output with tanh so off-manifold MLP extrapolation is impossible
+        m = 0.45 * torch.tanh(m)
         Gamma = torch.bmm(m.transpose(1, 2), m)
         return Gamma
 
     def fit(
         self,
         data: torch.Tensor,
-        epochs: int = 1000,
+        epochs: int = 800,
         batch_size: int = 256,
         lr: float = 1e-3,
         device: str = "cpu",
     ):
-        """Algorithm 2: Conditional Riemannian Metric Matching training."""
+        """
+        Trains the CDC network on centered conditional tangent covariances
+        Cov(X | Y=y) / (2*eps) so normal off-manifold drift d_perp^2 never corrupts Gamma_theta.
+        """
         self.to(device)
+        with torch.no_grad():
+            n_lm = min(256, data.shape[0])
+            idx = torch.randperm(data.shape[0], device=data.device)[:n_lm]
+            lm = data[idx].clone().detach().to(device)
+            self.landmarks.resize_(lm.shape).copy_(lm)
+            d2_lm = torch.cdist(lm, lm) ** 2
+            w_lm = torch.exp(-d2_lm / (2.0 * self.support_sigma ** 2)).mean(dim=-1)
+            self.ref_density.copy_(torch.quantile(w_lm, 0.85).clamp(min=1e-6))
+            self.has_landmarks.fill_(True)
+
         opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
         loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(data), batch_size=batch_size, shuffle=True
+            torch.utils.data.TensorDataset(data.detach()), batch_size=batch_size, shuffle=True
         )
+
+        ref_data = data[torch.randperm(data.shape[0])[:1024]].detach().to(device)
 
         self.train()
         for _ in range(epochs):
             for (x,) in loader:
                 x = x.to(device)
                 B = x.shape[0]
-                log_eps = torch.randn(B, 1, device=device) * 1.0 - 2.0
-                eps = torch.clamp(torch.exp(log_eps), min=1e-3, max=0.5)
+                # Sample noise scales focused around the local manifold neighborhood
+                log_eps = torch.randn(B, 1, device=device) * 0.6 - 3.2
+                eps = torch.clamp(torch.exp(log_eps), min=2e-3, max=0.08)
 
                 y = x + torch.sqrt(eps) * torch.randn_like(x)
-                delta = x - y
-                target = torch.bmm(delta.unsqueeze(-1), delta.unsqueeze(1)) / (2.0 * eps.unsqueeze(-1))
+
+                # Compute centered empirical posterior covariance E[(X - E[X|y])(X - E[X|y])^T | y] / (2*eps)
+                with torch.no_grad():
+                    diff_ref = ref_data.unsqueeze(0) - y.unsqueeze(1)  # [B, N_ref, D]
+                    d2_ref = torch.sum(diff_ref ** 2, dim=-1)          # [B, N_ref]
+                    w_post = torch.exp(-d2_ref / (2.0 * eps))          # Posterior weights p(x_n | y)
+                    w_post = w_post / (w_post.sum(dim=-1, keepdim=True) + 1e-8)
+                    mu_post = w_post @ ref_data                        # Conditional mean E[X | y]
+                    centered = ref_data.unsqueeze(0) - mu_post.unsqueeze(1)
+                    cov_post = torch.einsum("bn,bni,bnj->bij", w_post, centered, centered)
+                    target = (cov_post / (2.0 * eps.unsqueeze(-1))) * 0.25
 
                 pred = self.predict_cdc(y, eps)
                 loss = torch.mean(torch.sum((pred - target) ** 2, dim=(1, 2)))
@@ -200,10 +269,11 @@ class CDCMetric(BaseRiemannianMetric):
 
     def cometric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         B, D = x.shape
-        eps = torch.full((B, 1), self.eval_eps, device=x.device)
-        Gamma = self.predict_cdc(x, eps)
-        eye = torch.eye(D, device=x.device).unsqueeze(0).expand(B, D, D)
-        return Gamma + self.lambda_reg * eye
+        eps = torch.full((B, 1), self.eval_eps, device=x.device, dtype=x.dtype)
+        Gamma_raw = self.predict_cdc(x, eps)
+        h_x = self._support_envelope(x)  # [B, 1, 1] in [0, 1]
+        eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
+        return (h_x ** 2) * (Gamma_raw + self.c_iso * eye) + self.lambda_reg * eye
 
     def metric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         Gamma_reg = self.cometric_tensor(x)
