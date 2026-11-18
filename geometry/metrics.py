@@ -371,8 +371,10 @@ class VAEPullbackMetric(BaseRiemannianMetric):
         self.register_buffer("ref_max", ref_max)
 
     def _uncertainty_batch(self, z: torch.Tensor) -> torch.Tensor:
-        """Batched scalar uncertainty sigma(z) of shape [B, 1]."""
-        dist_sq = torch.cdist(z, self.centers) ** 2  # [B, M]
+        """Batched scalar uncertainty sigma(z) of shape [B, 1] using forward-AD compatible primitives."""
+        # z: [B, d], self.centers: [M, d] -> diff: [B, M, d]
+        diff = z.unsqueeze(1) - self.centers.unsqueeze(0)
+        dist_sq = torch.sum(diff**2, dim=-1)  # [B, M]
         w = torch.exp(-dist_sq / (2.0 * self.bandwidth**2)).mean(dim=-1, keepdim=True)
         h = torch.clamp(w / self.ref_max, min=0.0, max=1.0)
         return self.sigma_min + (self.sigma_max - self.sigma_min) * ((1.0 - h) ** 2)
