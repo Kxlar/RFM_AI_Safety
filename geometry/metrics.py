@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.func import vmap, jacrev
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -10,6 +11,7 @@ class BaseRiemannianMetric(ABC, nn.Module):
     Provides both G(x) (covariant metric tensor, small in data valleys and large off-manifold)
     and Gamma(x) = G(x)^{-1} (contravariant co-metric, large along data tangent and small off-manifold).
     """
+
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -24,7 +26,9 @@ class BaseRiemannianMetric(ABC, nn.Module):
         G = self.metric_tensor(x)
         return torch.linalg.inv(G)
 
-    def inner_product(self, x: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def inner_product(
+        self, x: torch.Tensor, u: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
         """Computes <u, v>_{G(x)} = u^T G(x) v of shape [B]."""
         G = self.metric_tensor(x)
         return torch.einsum("bi,bij,bj->b", u, G, v)
@@ -33,7 +37,9 @@ class BaseRiemannianMetric(ABC, nn.Module):
         """Computes ||u||_{G(x)}^2 of shape [B]."""
         return self.inner_product(x, u, u)
 
-    def riemannian_gradient(self, x: torch.Tensor, euclidean_grad: torch.Tensor) -> torch.Tensor:
+    def riemannian_gradient(
+        self, x: torch.Tensor, euclidean_grad: torch.Tensor
+    ) -> torch.Tensor:
         """Computes grad_g f(x) = G(x)^{-1} nabla f(x) of shape [B, D]."""
         Gamma = self.cometric_tensor(x)
         return torch.bmm(Gamma, euclidean_grad.unsqueeze(-1)).squeeze(-1)
@@ -44,6 +50,7 @@ class RBFMetric(BaseRiemannianMetric):
     Isotropic/Diagonal RBF Metric (Arvanitidis et al. / Kapusniak et al., 2024).
     Places Gaussian kernels on data centers; G(x) is small in data valleys and 1/lambda_reg on the empty plateau.
     """
+
     def __init__(
         self,
         data: torch.Tensor,
@@ -64,27 +71,27 @@ class RBFMetric(BaseRiemannianMetric):
 
         with torch.no_grad():
             d2 = torch.cdist(centers, centers) ** 2
-            w_ref = torch.exp(-d2 / (2.0 * self.bandwidth ** 2)).mean(dim=-1)
+            w_ref = torch.exp(-d2 / (2.0 * self.bandwidth**2)).mean(dim=-1)
             ref_max = torch.quantile(w_ref, 0.90).clamp(min=1e-6)
         self.register_buffer("ref_max", ref_max)
 
     def _weight_function(self, x: torch.Tensor) -> torch.Tensor:
         dist_sq = torch.cdist(x, self.centers) ** 2  # [B, M]
-        weights = torch.exp(-dist_sq / (2.0 * self.bandwidth ** 2))
+        weights = torch.exp(-dist_sq / (2.0 * self.bandwidth**2))
         h_x = torch.clamp(weights.mean(dim=-1) / self.ref_max, min=0.0, max=1.0)
         return h_x
 
     def metric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         B, D = x.shape
         h_x = self._weight_function(x)  # [B] in [0, 1]
-        scale = 1.0 / (0.15 * (h_x ** 2) + self.lambda_reg)
+        scale = 1.0 / (0.15 * (h_x**2) + self.lambda_reg)
         eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
         return scale.view(B, 1, 1) * eye
 
     def cometric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         B, D = x.shape
         h_x = self._weight_function(x)
-        scale = 0.15 * (h_x ** 2) + self.lambda_reg
+        scale = 0.15 * (h_x**2) + self.lambda_reg
         eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
         return scale.view(B, 1, 1) * eye
 
@@ -97,6 +104,7 @@ class LANDMetric(BaseRiemannianMetric):
     and gates with the smooth kernel density envelope h(x)^2 so G(x) forms a deep valley
     on the data manifold and rises smoothly to (1/lambda_reg)*I in empty space.
     """
+
     def __init__(
         self,
         data: torch.Tensor,
@@ -122,8 +130,8 @@ class LANDMetric(BaseRiemannianMetric):
     def cometric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         B, D = x.shape
         diff_to_x = self.data.unsqueeze(0) - x.unsqueeze(1)  # [B, N, D]
-        dist_sq = torch.sum(diff_to_x ** 2, dim=-1)          # [B, N]
-        weights = torch.exp(-dist_sq / (2.0 * self.sigma ** 2))  # [B, N]
+        dist_sq = torch.sum(diff_to_x**2, dim=-1)  # [B, N]
+        weights = torch.exp(-dist_sq / (2.0 * self.sigma**2))  # [B, N]
         w_norm = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
 
         # 1. Conditional manifold mean mu(x) = E[x_data | x] eliminates off-manifold bias!
@@ -131,15 +139,19 @@ class LANDMetric(BaseRiemannianMetric):
         diff_centered = self.data.unsqueeze(0) - mu_x.unsqueeze(1)  # [B, N, D]
 
         # 2. Local tangent covariance around mu(x), scaled to dimensionless units
-        Sigma_tan = torch.einsum("bn,bni,bnj->bij", w_norm, diff_centered, diff_centered)
-        Sigma_tan = Sigma_tan / (self.sigma ** 2) * 0.20
+        Sigma_tan = torch.einsum(
+            "bn,bni,bnj->bij", w_norm, diff_centered, diff_centered
+        )
+        Sigma_tan = Sigma_tan / (self.sigma**2) * 0.20
 
         # 3. Smooth data-support density envelope h(x) in [0, 1]
         w_supp = torch.exp(-dist_sq / (2.0 * (self.sigma * 0.85) ** 2))
-        h_x = torch.clamp(w_supp.mean(dim=-1) / self.ref_density, min=0.0, max=1.0).view(B, 1, 1)
+        h_x = torch.clamp(
+            w_supp.mean(dim=-1) / self.ref_density, min=0.0, max=1.0
+        ).view(B, 1, 1)
 
         eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
-        return (h_x ** 2) * (Sigma_tan + self.c_iso * eye) + self.lambda_reg * eye
+        return (h_x**2) * (Sigma_tan + self.c_iso * eye) + self.lambda_reg * eye
 
     def metric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         Gamma = self.cometric_tensor(x)
@@ -155,6 +167,7 @@ class CDCMetric(BaseRiemannianMetric):
       - On the data manifold: Gamma(x) is large and aligned with the manifold tangent (G(x) is small -> valley).
       - Off the manifold: Gamma(x) decays smoothly to lambda_reg * I (G(x) is large -> high walls).
     """
+
     def __init__(
         self,
         dim: int = 2,
@@ -190,7 +203,7 @@ class CDCMetric(BaseRiemannianMetric):
         if not self.has_landmarks.item():
             return torch.ones(x.shape[0], 1, 1, device=x.device, dtype=x.dtype)
         dist_sq = torch.cdist(x, self.landmarks) ** 2
-        w = torch.exp(-dist_sq / (2.0 * self.support_sigma ** 2)).mean(dim=-1)
+        w = torch.exp(-dist_sq / (2.0 * self.support_sigma**2)).mean(dim=-1)
         h_x = torch.clamp(w / self.ref_density, min=0.0, max=1.0)
         return h_x.view(-1, 1, 1)
 
@@ -223,14 +236,16 @@ class CDCMetric(BaseRiemannianMetric):
             lm = data[idx].clone().detach().to(device)
             self.landmarks.resize_(lm.shape).copy_(lm)
             d2_lm = torch.cdist(lm, lm) ** 2
-            w_lm = torch.exp(-d2_lm / (2.0 * self.support_sigma ** 2)).mean(dim=-1)
+            w_lm = torch.exp(-d2_lm / (2.0 * self.support_sigma**2)).mean(dim=-1)
             self.ref_density.copy_(torch.quantile(w_lm, 0.85).clamp(min=1e-6))
             self.has_landmarks.fill_(True)
 
         opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
         loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(data.detach()), batch_size=batch_size, shuffle=True
+            torch.utils.data.TensorDataset(data.detach()),
+            batch_size=batch_size,
+            shuffle=True,
         )
 
         ref_data = data[torch.randperm(data.shape[0])[:1024]].detach().to(device)
@@ -249,12 +264,16 @@ class CDCMetric(BaseRiemannianMetric):
                 # Compute centered empirical posterior covariance E[(X - E[X|y])(X - E[X|y])^T | y] / (2*eps)
                 with torch.no_grad():
                     diff_ref = ref_data.unsqueeze(0) - y.unsqueeze(1)  # [B, N_ref, D]
-                    d2_ref = torch.sum(diff_ref ** 2, dim=-1)          # [B, N_ref]
-                    w_post = torch.exp(-d2_ref / (2.0 * eps))          # Posterior weights p(x_n | y)
+                    d2_ref = torch.sum(diff_ref**2, dim=-1)  # [B, N_ref]
+                    w_post = torch.exp(
+                        -d2_ref / (2.0 * eps)
+                    )  # Posterior weights p(x_n | y)
                     w_post = w_post / (w_post.sum(dim=-1, keepdim=True) + 1e-8)
-                    mu_post = w_post @ ref_data                        # Conditional mean E[X | y]
+                    mu_post = w_post @ ref_data  # Conditional mean E[X | y]
                     centered = ref_data.unsqueeze(0) - mu_post.unsqueeze(1)
-                    cov_post = torch.einsum("bn,bni,bnj->bij", w_post, centered, centered)
+                    cov_post = torch.einsum(
+                        "bn,bni,bnj->bij", w_post, centered, centered
+                    )
                     target = (cov_post / (2.0 * eps.unsqueeze(-1))) * 0.25
 
                 pred = self.predict_cdc(y, eps)
@@ -273,7 +292,7 @@ class CDCMetric(BaseRiemannianMetric):
         Gamma_raw = self.predict_cdc(x, eps)
         h_x = self._support_envelope(x)  # [B, 1, 1] in [0, 1]
         eye = torch.eye(D, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, D, D)
-        return (h_x ** 2) * (Gamma_raw + self.c_iso * eye) + self.lambda_reg * eye
+        return (h_x**2) * (Gamma_raw + self.c_iso * eye) + self.lambda_reg * eye
 
     def metric_tensor(self, x: torch.Tensor) -> torch.Tensor:
         Gamma_reg = self.cometric_tensor(x)
@@ -285,7 +304,10 @@ class ConformalObstacleMetric(BaseRiemannianMetric):
     Wraps any base Riemannian metric G_data(x) with a conformal obstacle barrier:
     G_tilde(x) = (1 + beta * V(x)) G_data(x).
     """
-    def __init__(self, base_metric: BaseRiemannianMetric, potential_fn, beta: float = 10.0):
+
+    def __init__(
+        self, base_metric: BaseRiemannianMetric, potential_fn, beta: float = 10.0
+    ):
         super().__init__(dim=base_metric.dim)
         self.base_metric = base_metric
         self.potential_fn = potential_fn
@@ -302,3 +324,83 @@ class ConformalObstacleMetric(BaseRiemannianMetric):
         V = self.potential_fn.pointwise(x)  # [B]
         factor = (1.0 / (1.0 + self.beta * V)).view(-1, 1, 1)
         return factor * Gamma_base
+
+
+class VAEPullbackMetric(BaseRiemannianMetric):
+    """
+    Riemannian Pullback Metric for a Variational Autoencoder with locally adaptive
+    uncertainty (Arvanitidis, Hansen, & Hauberg, ICLR 2018 - 'Latent Space Oddity'):
+        G(z) = J_mu(z)^T J_mu(z) + J_sigma(z)^T J_sigma(z) + lambda_reg * I_d
+    where mu(z) is the neural decoder mean and sigma(z) is an RBF-calibrated uncertainty
+    field that is small near encoded training latents and large in empty latent space.
+    """
+
+    def __init__(
+        self,
+        decoder_mean_fn,
+        latent_data: torch.Tensor,
+        output_dim: int = 784,
+        num_rbf_centers: int = 256,
+        sigma_min: float = 0.05,
+        sigma_max: float = 1.25,
+        lambda_reg: float = 1e-2,
+    ):
+        super().__init__(dim=latent_data.shape[-1])
+        self.decoder_mean_fn = decoder_mean_fn
+        self.output_dim = output_dim
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.lambda_reg = lambda_reg
+
+        with torch.no_grad():
+            idx = torch.randperm(latent_data.shape[0])[
+                : min(num_rbf_centers, latent_data.shape[0])
+            ]
+            centers = latent_data[idx].clone().detach()
+            dists = torch.cdist(centers, centers)
+            bw = torch.median(dists[dists > 0]).item() * 0.45
+            w_ref = torch.exp(-(dists**2) / (2.0 * bw**2)).mean(dim=-1)
+            ref_max = torch.quantile(w_ref, 0.85).clamp(min=1e-6)
+
+        self.register_buffer("centers", centers)
+        self.register_buffer("bandwidth", torch.tensor(bw, device=latent_data.device))
+        self.register_buffer("ref_max", ref_max)
+
+    def _uncertainty_scalar(self, z: torch.Tensor) -> torch.Tensor:
+        """Scalar std sigma(z): small (sigma_min) on latent support, large (sigma_max) in empty space."""
+        dist_sq = torch.sum((z.unsqueeze(0) - self.centers) ** 2, dim=-1)  # [M]
+        w = torch.exp(-dist_sq / (2.0 * self.bandwidth**2)).mean()
+        h = torch.clamp(w / self.ref_max, min=0.0, max=1.0)
+        return self.sigma_min + (self.sigma_max - self.sigma_min) * ((1.0 - h) ** 2)
+
+    def metric_tensor(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Computes G(z) = J_mu(z)^T J_mu(z) + D_out * (nabla_z sigma(z)) (nabla_z sigma(z))^T + lambda_reg * I
+        using vectorized `vmap(jacrev)` for fast batched Jacobian evaluation in R^d.
+        """
+        B, d = z.shape
+        z_det = z.detach()
+
+        def single_mu(z_single: torch.Tensor) -> torch.Tensor:
+            return self.decoder_mean_fn(z_single.unsqueeze(0)).squeeze(0)
+
+        def single_sigma(z_single: torch.Tensor) -> torch.Tensor:
+            return self._uncertainty_scalar(z_single)
+
+        with torch.no_grad():
+            J_mu = vmap(jacrev(single_mu))(z_det)  # [B, D_out, d]
+            grad_sigma = vmap(jacrev(single_sigma))(z_det)  # [B, d]
+
+            G_mu = torch.bmm(J_mu.transpose(1, 2), J_mu)  # [B, d, d]
+            G_sig = self.output_dim * torch.bmm(
+                grad_sigma.unsqueeze(-1), grad_sigma.unsqueeze(1)
+            )
+            eye = (
+                torch.eye(d, device=z.device, dtype=z.dtype)
+                .unsqueeze(0)
+                .expand(B, d, d)
+            )
+            # Normalize scale so eigenvalues are well-conditioned (~ O(1) to O(100))
+            G = (G_mu + G_sig) / float(self.output_dim) * 25.0 + self.lambda_reg * eye
+
+        return G
