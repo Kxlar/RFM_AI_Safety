@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.func import vmap, jacrev
+from torch.func import vmap, jacfwd, jvp
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -331,8 +331,10 @@ class VAEPullbackMetric(BaseRiemannianMetric):
     Riemannian Pullback Metric for a Variational Autoencoder with locally adaptive
     uncertainty (Arvanitidis, Hansen, & Hauberg, ICLR 2018 - 'Latent Space Oddity'):
         G(z) = J_mu(z)^T J_mu(z) + J_sigma(z)^T J_sigma(z) + lambda_reg * I_d
-    where mu(z) is the neural decoder mean and sigma(z) is an RBF-calibrated uncertainty
-    field that is small near encoded training latents and large in empty latent space.
+    - Uses `jacfwd` (O(d) forward passes instead of O(784) reverse passes) when forming G(z).
+    - Overrides `inner_product` and `norm_squared` using a single O(1) `jvp` directional
+      derivative ||J_mu(z) v||^2 so computing geodesic arc-lengths never materializes
+      the [B, 784, d] Jacobian!
     """
 
     def __init__(
@@ -344,6 +346,7 @@ class VAEPullbackMetric(BaseRiemannianMetric):
         sigma_min: float = 0.05,
         sigma_max: float = 1.25,
         lambda_reg: float = 1e-2,
+        max_batch_chunk: int = 1024,
     ):
         super().__init__(dim=latent_data.shape[-1])
         self.decoder_mean_fn = decoder_mean_fn
@@ -351,6 +354,7 @@ class VAEPullbackMetric(BaseRiemannianMetric):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.lambda_reg = lambda_reg
+        self.max_batch_chunk = max_batch_chunk
 
         with torch.no_grad():
             idx = torch.randperm(latent_data.shape[0])[
@@ -366,17 +370,52 @@ class VAEPullbackMetric(BaseRiemannianMetric):
         self.register_buffer("bandwidth", torch.tensor(bw, device=latent_data.device))
         self.register_buffer("ref_max", ref_max)
 
-    def _uncertainty_scalar(self, z: torch.Tensor) -> torch.Tensor:
-        """Scalar std sigma(z): small (sigma_min) on latent support, large (sigma_max) in empty space."""
-        dist_sq = torch.sum((z.unsqueeze(0) - self.centers) ** 2, dim=-1)  # [M]
+    def _uncertainty_batch(self, z: torch.Tensor) -> torch.Tensor:
+        """Batched scalar uncertainty sigma(z) of shape [B, 1]."""
+        dist_sq = torch.cdist(z, self.centers) ** 2  # [B, M]
+        w = torch.exp(-dist_sq / (2.0 * self.bandwidth**2)).mean(dim=-1, keepdim=True)
+        h = torch.clamp(w / self.ref_max, min=0.0, max=1.0)
+        return self.sigma_min + (self.sigma_max - self.sigma_min) * ((1.0 - h) ** 2)
+
+    def _uncertainty_single(self, z_single: torch.Tensor) -> torch.Tensor:
+        dist_sq = torch.sum((z_single.unsqueeze(0) - self.centers) ** 2, dim=-1)
         w = torch.exp(-dist_sq / (2.0 * self.bandwidth**2)).mean()
         h = torch.clamp(w / self.ref_max, min=0.0, max=1.0)
         return self.sigma_min + (self.sigma_max - self.sigma_min) * ((1.0 - h) ** 2)
 
+    def inner_product(
+        self, x: torch.Tensor, u: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Computes <u, v>_{G(x)} in O(1) forward JVP passes without forming the [B, 784, d] Jacobian!
+        Since u^T (J_mu^T J_mu) v = <J_mu u, J_mu v>, we simply evaluate jvp(decoder, x, u) and jvp(decoder, x, v).
+        """
+        _, j_mu_u = jvp(self.decoder_mean_fn, (x,), (u,))
+        if u is v:
+            j_mu_v = j_mu_u
+        else:
+            _, j_mu_v = jvp(self.decoder_mean_fn, (x,), (v,))
+
+        _, d_sig_u = jvp(self._uncertainty_batch, (x,), (u,))
+        if u is v:
+            d_sig_v = d_sig_u
+        else:
+            _, d_sig_v = jvp(self._uncertainty_batch, (x,), (v,))
+
+        term_mu = torch.sum(j_mu_u * j_mu_v, dim=-1)
+        term_sig = self.output_dim * (d_sig_u.squeeze(-1) * d_sig_v.squeeze(-1))
+        term_reg = self.lambda_reg * torch.sum(u * v, dim=-1)
+
+        return (term_mu + term_sig) / float(self.output_dim) * 25.0 + term_reg
+
+    def norm_squared(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """Computes ||u||_{G(x)}^2 in a single O(1) forward-mode JVP pass!"""
+        return self.inner_product(x, u, u)
+
     def metric_tensor(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Computes G(z) = J_mu(z)^T J_mu(z) + D_out * (nabla_z sigma(z)) (nabla_z sigma(z))^T + lambda_reg * I
-        using vectorized `vmap(jacrev)` for fast batched Jacobian evaluation in R^d.
+        Computes explicit [B, d, d] metric tensor G(z) using `jacfwd` (O(d) columns instead of O(784) rows)
+        in memory-safe chunks of size `max_batch_chunk`.
         """
         B, d = z.shape
         z_det = z.detach()
@@ -384,23 +423,24 @@ class VAEPullbackMetric(BaseRiemannianMetric):
         def single_mu(z_single: torch.Tensor) -> torch.Tensor:
             return self.decoder_mean_fn(z_single.unsqueeze(0)).squeeze(0)
 
-        def single_sigma(z_single: torch.Tensor) -> torch.Tensor:
-            return self._uncertainty_scalar(z_single)
+        out_G = torch.empty((B, d, d), device=z.device, dtype=z.dtype)
+        eye_chunk = torch.eye(d, device=z.device, dtype=z.dtype).unsqueeze(0)
 
         with torch.no_grad():
-            J_mu = vmap(jacrev(single_mu))(z_det)  # [B, D_out, d]
-            grad_sigma = vmap(jacrev(single_sigma))(z_det)  # [B, d]
+            for start in range(0, B, self.max_batch_chunk):
+                end = min(start + self.max_batch_chunk, B)
+                zb = z_det[start:end]
 
-            G_mu = torch.bmm(J_mu.transpose(1, 2), J_mu)  # [B, d, d]
-            G_sig = self.output_dim * torch.bmm(
-                grad_sigma.unsqueeze(-1), grad_sigma.unsqueeze(1)
-            )
-            eye = (
-                torch.eye(d, device=z.device, dtype=z.dtype)
-                .unsqueeze(0)
-                .expand(B, d, d)
-            )
-            # Normalize scale so eigenvalues are well-conditioned (~ O(1) to O(100))
-            G = (G_mu + G_sig) / float(self.output_dim) * 25.0 + self.lambda_reg * eye
+                # jacfwd differentiates over d latent dimensions (e.g. d=2) instead of 784 pixels!
+                J_mu = vmap(jacfwd(single_mu))(zb)  # [B_c, 784, d]
+                grad_sigma = vmap(jacfwd(self._uncertainty_single))(zb)  # [B_c, d]
 
-        return G
+                G_mu = torch.bmm(J_mu.transpose(1, 2), J_mu)  # [B_c, d, d]
+                G_sig = self.output_dim * torch.bmm(
+                    grad_sigma.unsqueeze(-1), grad_sigma.unsqueeze(1)
+                )
+                out_G[start:end] = (G_mu + G_sig) / float(
+                    self.output_dim
+                ) * 25.0 + self.lambda_reg * eye_chunk
+
+        return out_G
