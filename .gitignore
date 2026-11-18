@@ -11,4 +11,4 @@ __pycache__/*
 *.sh
 *.pyc
 
-data/
+data/*
