@@ -17,6 +17,7 @@ class MetricFlowMatching(nn.Module):
       Stage 2: Train TimeVelocityMLP v_theta(x, t) on the induced geodesic vector field dot_gamma_eta(t).
                At test time, only v_theta is integrated (metric G is dropped).
     """
+
     def __init__(
         self,
         dim: int = 2,
@@ -48,7 +49,9 @@ class MetricFlowMatching(nn.Module):
         for p in self.interpolant_net.parameters():
             p.requires_grad_(True)
 
-        optimizer = optim.AdamW(self.interpolant_net.parameters(), lr=lr, weight_decay=1e-5)
+        optimizer = optim.AdamW(
+            self.interpolant_net.parameters(), lr=lr, weight_decay=1e-5
+        )
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data), batch_size=batch_size, shuffle=True
@@ -64,22 +67,17 @@ class MetricFlowMatching(nn.Module):
                     x0, x1 = self.coupler.couple(x0, x1)
 
                 t = torch.rand(x1.shape[0], 1, device=device)
-                xt, dot_xt = self.interpolant_net.position_and_velocity(x0, x1, t)
-
+                xt, dot_xt = self.interpolant_net.pos_and_vel(x0, x1, t)
                 if self.metric is not None:
-                    G = self.metric.metric_tensor(xt)
-                    kinetic = 0.5 * torch.bmm(
-                        dot_xt.unsqueeze(1), torch.bmm(G, dot_xt.unsqueeze(-1))
-                    ).squeeze(-1).squeeze(-1)
+                    kinetic = 0.5 * self.metric.norm_squared(xt, dot_xt)
                 else:
-                    kinetic = 0.5 * torch.sum(dot_xt ** 2, dim=-1)
+                    kinetic = 0.5 * torch.sum(dot_xt**2, dim=-1)
 
                 if self.potential is not None:
-                    pot_val = self.potential(xt, t)
+                    pot = self.potential.pointwise(xt)
+                    loss = torch.mean(kinetic + pot)
                 else:
-                    pot_val = 0.0
-
-                loss = torch.mean(kinetic + pot_val)
+                    loss = torch.mean(kinetic)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -125,13 +123,10 @@ class MetricFlowMatching(nn.Module):
 
                 vt = self.v_net(xt, t)
                 diff = vt - ut
-
                 if self.metric is not None:
-                    with torch.no_grad():
-                        G = self.metric.metric_tensor(xt).detach()
-                    loss = torch.mean(torch.bmm(diff.unsqueeze(1), torch.bmm(G, diff.unsqueeze(-1))))
+                    loss = torch.mean(self.metric.norm_squared(xt.detach(), diff))
                 else:
-                    loss = torch.mean(diff ** 2)
+                    loss = torch.mean(diff**2)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -151,5 +146,9 @@ class MetricFlowMatching(nn.Module):
         lr: float = 1e-3,
         device: str = "cpu",
     ):
-        self.fit_interpolant(data, epochs=epochs_interpolant, batch_size=batch_size, lr=lr, device=device)
-        self.fit_flow(data, epochs=epochs_flow, batch_size=batch_size, lr=lr, device=device)
+        self.fit_interpolant(
+            data, epochs=epochs_interpolant, batch_size=batch_size, lr=lr, device=device
+        )
+        self.fit_flow(
+            data, epochs=epochs_flow, batch_size=batch_size, lr=lr, device=device
+        )

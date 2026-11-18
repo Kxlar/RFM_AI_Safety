@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 
 from geometry.metrics import (
     CDCMetric,
@@ -124,7 +123,7 @@ class MNISTVAE(nn.Module):
             torch.utils.data.TensorDataset(x_data), batch_size=batch_size, shuffle=True
         )
         self.train()
-        for ep in range(epochs):
+        for _ in range(epochs):
             for (xb,) in loader:
                 xb = xb.to(device)
                 mu, logvar = self.encode_raw(xb)
@@ -221,17 +220,9 @@ def plot_mnist_avoidance_results(
     title: str,
     output_path: str,
 ):
-    """
-    Creates a 3-Panel MNIST Class Avoidance Figure:
-      Panel 1: Latent Space (First 2 dims) colored by MNIST Digit Class + Intrinsic Barrier Contours
-      Panel 2: Simulated Latent Flow Trajectories (t=0 -> t=1) avoiding the Forbidden Digit Cluster
-      Panel 3: 8x8 Grid of Decoded Generated MNIST Images with Oracle Predicted Class Labels
-               (Highlights any leaked forbidden digit in red!)
-    """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     device = latents.device
 
-    # If latent_dim > 2, project onto the top 2 principal axes of the latent space for 2D visualization
     D = latents.shape[-1]
     if D > 2:
         mu_z = latents.mean(dim=0, keepdim=True)
@@ -253,14 +244,12 @@ def plot_mnist_avoidance_results(
     y_np = labels.cpu().numpy()
     fig = plt.figure(figsize=(22, 7.0))
 
-    # Precompute 2D grid in the visualization plane
     gx, gy = np.meshgrid(np.linspace(-2.8, 2.8, 90), np.linspace(-2.8, 2.8, 90))
     grid_2d = torch.tensor(
         np.stack([gx.ravel(), gy.ravel()], axis=-1), dtype=torch.float32, device=device
     )
     if P2 is not None:
-        # Lift 2D slice through the forbidden centroid in R^D
-        c_full = potential.center.view(1, D)
+        c_full = potential.center.reshape(1, D)
         c_2d = (c_full - mu_z) @ P2
         grid_full = c_full + (grid_2d - c_2d) @ P2.T
     else:
@@ -418,7 +407,7 @@ def plot_mnist_avoidance_results(
 
 
 # =====================================================================
-# 3. Main CLI Runner for MNIST PCA vs. VAE Class Avoidance
+# 3. Main CLI Runner with Full Model & Barrier Checkpoint Caching
 # =====================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -483,8 +472,9 @@ def parse_args():
     parser.add_argument(
         "--obstacle-mode",
         type=str,
-        default="both",
+        default="inference",
         choices=["none", "baked", "inference", "both"],
+        help="Use 'inference' (or 'none') to share a single trained unbaked model across all barriers & digits!",
     )
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument(
@@ -498,7 +488,11 @@ def parse_args():
     )
     parser.add_argument("--alpha", type=float, default=1.25)
     parser.add_argument("--gyro-curl", type=float, default=0.65)
-    parser.add_argument("--load-existing", action="store_true")
+    parser.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help="Force retraining even if checkpoint exists on disk",
+    )
     parser.add_argument("--results-dir", type=str, default="./results_mnist")
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
@@ -513,28 +507,51 @@ def main():
 
     ckpt_dir = os.path.join(args.results_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
+    use_cache = not args.force_retrain
 
-    # Note: If embedding is PCA, pullback is Euclidean I_d, so default 'pullback' to 'cdc' on PCA latents
+    # If embedding is PCA, pullback is Euclidean I_d, so default 'pullback' to 'cdc' on PCA latents
     eff_metric = (
         "cdc"
         if (args.embedding == "pca" and args.metric == "pullback")
         else args.metric
     )
+    ot_str = "ot_none" if args.ot == "none" else f"ot_{args.ot}_{args.ot_method}"
 
     fname = (
         f"mnist_{args.embedding}_d{args.latent_dim}_forbid{args.forbidden_digit}_"
-        f"{args.barrier}_{args.model}_{eff_metric}_{args.obstacle_mode}.png"
+        f"{args.barrier}_{args.model}_{eff_metric}_{ot_str}_{args.obstacle_mode}.png"
     )
     out_path = os.path.join(args.results_dir, fname)
 
-    print("=" * 80)
+    # Smart Checkpoint Naming:
+    # - When obstacle_mode in ['none', 'inference'], the trained model is UNBAKED and completely
+    #   independent of `--barrier` and `--forbidden-digit`! Thus 1 trained model serves ALL barriers & digits!
+    # - When obstacle_mode in ['baked', 'both'], the potential V(z) is baked into training, so the checkpoint
+    #   is tagged with the specific barrier and forbidden digit.
+    is_baked = args.obstacle_mode in ["baked", "both"]
+    if is_baked:
+        bake_tag = f"baked_{args.barrier}_forbid{args.forbidden_digit}"
+    else:
+        bake_tag = "unbaked"
+
+    interp_ckpt = os.path.join(
+        ckpt_dir,
+        f"interp_{args.embedding}_d{args.latent_dim}_{eff_metric}_{bake_tag}_ep{args.epochs}.pt",
+    )
+    flow_ckpt = os.path.join(
+        ckpt_dir,
+        f"flow_{args.model}_{args.embedding}_d{args.latent_dim}_{eff_metric}_{args.premetric}_{ot_str}_{bake_tag}_ep{args.epochs}.pt",
+    )
+
+    print("=" * 85)
     print(
         f"MNIST Class Avoidance | Embedding: {args.embedding.upper()} (D={args.latent_dim}) | Forbid Digit: {args.forbidden_digit}"
     )
     print(
         f"Barrier Shape: {args.barrier.upper()} | Model: {args.model.upper()} | Metric: {eff_metric.upper()} | Mode: {args.obstacle_mode.upper()}"
     )
-    print("=" * 80)
+    print(f"Flow Checkpoint: {os.path.basename(flow_ckpt)} (Auto-Cache: {use_cache})")
+    print("=" * 85)
 
     # 1. Load MNIST Dataset
     torch.manual_seed(42)
@@ -542,14 +559,14 @@ def main():
         root="./data", train=True, download=True, transform=transforms.ToTensor()
     )
     idx_sub = torch.randperm(len(mnist_ds))[: args.n_train]
-    x_pixels = mnist_ds.data[idx_sub].float().view(-1, 784) / 255.0
+    x_pixels = mnist_ds.data[idx_sub].float().reshape(-1, 784) / 255.0
     y_labels = mnist_ds.targets[idx_sub].long()
     x_pixels, y_labels = x_pixels.to(dev), y_labels.to(dev)
 
-    # 2. Train or Load Pixel Oracle Classifier (to evaluate generated images objectively)
+    # 2. Train or Load Pixel Oracle Classifier
     oracle_clf = PixelOracleClassifier().to(dev)
     oracle_ckpt = os.path.join(ckpt_dir, "pixel_oracle_clf.pt")
-    if os.path.exists(oracle_ckpt):
+    if use_cache and os.path.exists(oracle_ckpt):
         oracle_clf.load_state_dict(torch.load(oracle_ckpt, map_location=dev))
         oracle_clf.eval()
     else:
@@ -565,8 +582,8 @@ def main():
     else:
         embedder = MNISTVAE(latent_dim=args.latent_dim).to(dev)
         vae_ckpt = os.path.join(ckpt_dir, f"mnist_vae_d{args.latent_dim}.pt")
-        if os.path.exists(vae_ckpt):
-            print(f"Loading cached MNIST VAE (D={args.latent_dim})...")
+        if use_cache and os.path.exists(vae_ckpt):
+            print(f"[Cache] Loading MNIST VAE (D={args.latent_dim}) from {vae_ckpt}...")
             embedder.load_state_dict(torch.load(vae_ckpt, map_location=dev))
             embedder.eval()
         else:
@@ -575,13 +592,11 @@ def main():
             torch.save(embedder.state_dict(), vae_ckpt)
         z_data = embedder.encode(x_pixels)
 
-    # Separate safe vs. forbidden ground-truth latents
     forb_mask = y_labels == args.forbidden_digit
     safe_mask = ~forb_mask
     z_forb = z_data[forb_mask]
     z_safe = z_data[safe_mask]
 
-    # Compute Oracle Half-Split MMD on Safe Latent Data
     perm_s = torch.randperm(z_safe.shape[0], device=dev)
     oracle_half_mmd = compute_mmd_rbf(
         z_safe[perm_s[: len(perm_s) // 2]],
@@ -602,7 +617,8 @@ def main():
             dim=args.latent_dim, rank=args.latent_dim, hidden_dim=128, lambda_reg=1e-2
         ).to(dev)
         cdc_ckpt = os.path.join(ckpt_dir, f"cdc_{args.embedding}_d{args.latent_dim}.pt")
-        if os.path.exists(cdc_ckpt):
+        if use_cache and os.path.exists(cdc_ckpt):
+            print(f"[Cache] Loading CDC Metric from {cdc_ckpt}...")
             base_metric.load_state_dict(torch.load(cdc_ckpt, map_location=dev))
             base_metric.eval()
         else:
@@ -657,11 +673,22 @@ def main():
             p_cutoff=0.06,
             scale=35.0,
         ).to(dev)
-        print("Training Latent MLP Barrier Classifier...")
-        potential.fit_classifier(z_data, y_labels, epochs=200, device=dev)
+        clf_ckpt = os.path.join(
+            ckpt_dir, f"latent_barrier_clf_{args.embedding}_d{args.latent_dim}.pt"
+        )
+        if use_cache and os.path.exists(clf_ckpt):
+            print(f"[Cache] Loading Latent Barrier Classifier from {clf_ckpt}...")
+            potential.classifier.load_state_dict(torch.load(clf_ckpt, map_location=dev))
+            potential.classifier.eval()
+            with torch.no_grad():
+                if z_forb.shape[0] > 0:
+                    potential.center.copy_(z_forb.mean(dim=0, keepdim=True))
+        else:
+            print("Training Latent MLP Barrier Classifier...")
+            potential.fit_classifier(z_data, y_labels, epochs=200, device=dev)
+            torch.save(potential.classifier.state_dict(), clf_ckpt)
 
-    # 7. Configure Coupler & Train Flow Model
-    is_baked = args.obstacle_mode in ["baked", "both"]
+    # 7. Configure Coupler & Train (or Load Cached) Flow Model
     active_metric = base_metric
     if is_baked and base_metric is not None and args.model == "rfm":
         active_metric = ConformalObstacleMetric(
@@ -684,7 +711,14 @@ def main():
             premetric=premetric,
             coupler=coupler,
         ).to(dev)
-        model.fit(z_data, epochs=args.epochs, device=dev)
+        if use_cache and os.path.exists(flow_ckpt):
+            print(f"[Cache] Loading trained RFM model from {flow_ckpt}...")
+            model.v_net.load_state_dict(torch.load(flow_ckpt, map_location=dev))
+            model.eval()
+        else:
+            model.fit(z_data, epochs=args.epochs, device=dev)
+            torch.save(model.v_net.state_dict(), flow_ckpt)
+            print(f"[Cache] Saved RFM model to {flow_ckpt}")
 
     elif args.model == "mfm":
         model = MetricFlowMatching(
@@ -693,7 +727,18 @@ def main():
             potential=potential if is_baked else None,
             coupler=coupler,
         ).to(dev)
-        model.fit_interpolant(z_data, epochs=int(args.epochs * 0.7), device=dev)
+
+        # Stage 1: Load or Train Geodesic Interpolant
+        if use_cache and os.path.exists(interp_ckpt):
+            print(f"[Cache] Loading MFM Stage 1 Interpolant from {interp_ckpt}...")
+            model.interpolant_net.load_state_dict(
+                torch.load(interp_ckpt, map_location=dev)
+            )
+            model.interpolant_net.eval()
+        else:
+            model.fit_interpolant(z_data, epochs=int(args.epochs * 0.7), device=dev)
+            torch.save(model.interpolant_net.state_dict(), interp_ckpt)
+            print(f"[Cache] Saved MFM Stage 1 Interpolant to {interp_ckpt}")
 
         if base_metric is not None and args.premetric == "geodesic":
             geo_pm = MFMGeodesicPremetric(
@@ -708,7 +753,15 @@ def main():
                     premetric=geo_pm, method=args.ot_method
                 )
 
-        model.fit_flow(z_data, epochs=args.epochs, device=dev)
+        # Stage 2: Load or Train Flow Velocity Network
+        if use_cache and os.path.exists(flow_ckpt):
+            print(f"[Cache] Loading MFM Stage 2 Velocity Network from {flow_ckpt}...")
+            model.v_net.load_state_dict(torch.load(flow_ckpt, map_location=dev))
+            model.eval()
+        else:
+            model.fit_flow(z_data, epochs=args.epochs, device=dev)
+            torch.save(model.v_net.state_dict(), flow_ckpt)
+            print(f"[Cache] Saved MFM Stage 2 Velocity Network to {flow_ckpt}")
 
     elif args.model == "rmeanfm":
         mfm_s1 = MetricFlowMatching(
@@ -717,14 +770,45 @@ def main():
             potential=potential if is_baked else None,
             coupler=coupler,
         ).to(dev)
-        mfm_s1.fit_interpolant(z_data, epochs=int(args.epochs * 0.65), device=dev)
+
+        # Stage 1 Interpolant is shared directly with MFM!
+        if use_cache and os.path.exists(interp_ckpt):
+            print(f"[Cache] Loading Stage 1 Interpolant from {interp_ckpt}...")
+            mfm_s1.interpolant_net.load_state_dict(
+                torch.load(interp_ckpt, map_location=dev)
+            )
+            mfm_s1.interpolant_net.eval()
+        else:
+            mfm_s1.fit_interpolant(z_data, epochs=int(args.epochs * 0.7), device=dev)
+            torch.save(mfm_s1.interpolant_net.state_dict(), interp_ckpt)
+            print(f"[Cache] Saved Stage 1 Interpolant to {interp_ckpt}")
+
+        if base_metric is not None and args.premetric == "geodesic":
+            geo_pm = MFMGeodesicPremetric(
+                mfm_interpolant=mfm_s1.interpolant_net,
+                metric=base_metric,
+                num_quad_steps=6,
+            ).to(dev)
+            if isinstance(potential, CompactForbiddenPotential):
+                potential.premetric = geo_pm
+            if args.ot == "premetric":
+                coupler = MinibatchOTCoupler(premetric=geo_pm, method=args.ot_method)
+
         model = RiemannianMeanFlow(
             dim=args.latent_dim,
             interpolant_net=mfm_s1.interpolant_net,
             metric=active_metric,
             coupler=coupler,
         ).to(dev)
-        model.fit(z_data, epochs=args.epochs, device=dev)
+
+        if use_cache and os.path.exists(flow_ckpt):
+            print(f"[Cache] Loading RMeanFM Velocity Network from {flow_ckpt}...")
+            model.u_net.load_state_dict(torch.load(flow_ckpt, map_location=dev))
+            model.eval()
+        else:
+            model.fit(z_data, epochs=args.epochs, device=dev)
+            torch.save(model.u_net.state_dict(), flow_ckpt)
+            print(f"[Cache] Saved RMeanFM Velocity Network to {flow_ckpt}")
 
     # 8. Evaluate & Decode Generated Samples
     z0_eval = torch.randn(args.n_samples, args.latent_dim, device=dev)
@@ -751,7 +835,6 @@ def main():
         latent_path_viol = viol_flat.any(dim=0).float().mean().item() * 100.0
         latent_end_viol = viol_flat[-1].float().mean().item() * 100.0
 
-        # Decode latents back to 28x28 MNIST images & classify with Pixel Oracle!
         decoded_imgs = embedder.decode(z1_gen)
         logits_oracle = oracle_clf(decoded_imgs)
         probs_oracle = torch.softmax(logits_oracle, dim=-1)
@@ -763,7 +846,7 @@ def main():
         latent_safe_mmd = compute_mmd_rbf(z1_gen, z_safe)
 
     elapsed = time.perf_counter() - t_start
-    print("-" * 80)
+    print("-" * 85)
     print(
         f"[Latent Barrier] Path Viol: {latent_path_viol:.2f}% | Endpoint Viol: {latent_end_viol:.2f}%"
     )
@@ -774,9 +857,8 @@ def main():
         f"[Manifold MMD]   Safe Latent MMD: {latent_safe_mmd:.5f} (Oracle Half-Split MMD: {oracle_half_mmd:.5f})"
     )
     print(f"[Runtime]        {elapsed:.1f}s")
-    print("-" * 80)
+    print("-" * 85)
 
-    # Log to CSV
     csv_path = os.path.join(args.results_dir, "mnist_summary.csv")
     write_hdr = not os.path.exists(csv_path)
     with open(csv_path, mode="a", newline="", encoding="utf-8") as f_csv:
@@ -791,6 +873,7 @@ def main():
                     "barrier",
                     "model",
                     "metric",
+                    "ot",
                     "obstacle_mode",
                     "latent_path_viol_pct",
                     "latent_end_viol_pct",
@@ -809,6 +892,7 @@ def main():
                 args.barrier,
                 args.model,
                 eff_metric,
+                ot_str,
                 args.obstacle_mode,
                 f"{latent_path_viol:.2f}",
                 f"{latent_end_viol:.2f}",
